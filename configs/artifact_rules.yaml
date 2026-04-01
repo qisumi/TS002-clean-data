@@ -1,0 +1,71 @@
+defaults:
+  zero_block_min_length: 4
+  zero_tolerance: 1.0e-12
+  flat_run_min_length: 8
+  flat_tolerance: 1.0e-12
+  near_constant_window: 24
+  near_constant_min_length: 24
+  near_constant_std_ratio: 0.01
+  near_constant_min_std: 1.0e-6
+  repetition_window: 24
+  repetition_min_length: 48
+  repetition_tolerance_ratio: 0.001
+  repetition_min_abs_tolerance: 1.0e-6
+
+datasets:
+  ETTh1:
+    zero_block_min_length: 3
+    flat_run_min_length: 6
+    near_constant_window: 12
+    near_constant_min_length: 12
+    repetition_window: 12
+    repetition_min_length: 24
+  ETTh2:
+    zero_block_min_length: 3
+    flat_run_min_length: 6
+    near_constant_window: 12
+    near_constant_min_length: 12
+    repetition_window: 12
+    repetition_min_length: 24
+  ETTm1:
+    zero_block_min_length: 12
+    flat_run_min_length: 8
+    near_constant_window: 24
+    near_constant_min_length: 24
+    repetition_window: 24
+    repetition_min_length: 48
+  ETTm2:
+    zero_block_min_length: 12
+    flat_run_min_length: 8
+    near_constant_window: 24
+    near_constant_min_length: 24
+    repetition_window: 24
+    repetition_min_length: 48
+  solar_AL:
+    zero_block_min_length: 12
+    flat_run_min_length: 12
+    near_constant_window: 36
+    near_constant_min_length: 36
+    repetition_window: 72
+    repetition_min_length: 144
+  weather:
+    zero_block_min_length: 12
+    flat_run_min_length: 12
+    near_constant_window: 36
+    near_constant_min_length: 36
+    repetition_window: 72
+    repetition_min_length: 144
+  exchange_rate:
+    zero_block_min_length: 3
+    flat_run_min_length: 5
+    near_constant_window: 14
+    near_constant_min_length: 14
+    repetition_window: 14
+    repetition_min_length: 28
+  electricity:
+    zero_block_min_length: 6
+    flat_run_min_length: 8
+    near_constant_window: 24
+    near_constant_min_length: 24
+    repetition_window: 24
+    repetition_min_length: 48

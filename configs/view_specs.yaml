@@ -1,0 +1,140 @@
+defaults:
+  lookback: 96
+  horizons: [96, 192, 336, 720]
+  support:
+    min_anchor_train_windows: 500
+    min_anchor_train_ratio: 0.05
+    min_conservative_train_windows: 1000
+    min_conservative_train_ratio: 0.10
+  weights:
+    corrupted_high: 1.0
+    suspicious_high: 0.8
+    suspicious_medium: 0.6
+    valid_high: 0.4
+    valid_medium: 0.2
+    valid_low: 0.0
+
+ETTh2:
+  anchor_clean:
+    max_input_contam: 0.02
+    max_target_contam: 0.0
+    forbid_target_validity: [corrupted, suspicious]
+    veto_multivar_severe: true
+    veto_ot_severe: true
+  conservative_clean:
+    max_input_contam: 0.10
+    max_target_contam: 0.02
+    forbid_target_validity: [corrupted]
+  intervened:
+    allow_repairable_input: true
+    allow_unrecoverable_input_mask_only: true
+    forbid_unrecoverable_target: true
+
+ETTm2:
+  anchor_clean:
+    max_input_contam: 0.01
+    max_target_contam: 0.0
+    forbid_target_validity: [corrupted, suspicious]
+    veto_multivar_severe: true
+  conservative_clean:
+    max_input_contam: 0.08
+    max_target_contam: 0.01
+    forbid_target_validity: [corrupted]
+    fallback_to_intervention_if_support_low: true
+  intervened:
+    allow_repairable_input: true
+    allow_unrecoverable_input_mask_only: true
+    forbid_unrecoverable_target: true
+
+solar_AL:
+  anchor_clean:
+    require_target_dominant_phase: active
+    min_target_active_share: 0.80
+    max_target_contam: 0.05
+    max_input_contam: 0.20
+    max_input_night_share: 0.20
+    forbid_target_suspicious: true
+  conservative_clean:
+    max_target_night_share: 0.00
+    min_target_daylike_share: 0.80
+    max_target_contam: 0.10
+    max_input_contam: 0.25
+  phase_balanced:
+    enabled: true
+    stratify_by: dominant_phase_target
+    min_phases: 2
+    min_per_phase: 100
+    weight_clip: [0.5, 3.0]
+  active_only:
+    enabled: true
+    min_target_active_share: 0.95
+    max_input_night_share: 0.10
+  daytime_only:
+    enabled: true
+    max_target_night_share: 0.00
+    max_input_night_share: 0.05
+  intervened:
+    mask_night_phase: true
+    mask_transition_phase: true
+    never_repair_night_values: true
+    forbid_unrecoverable_target: true
+
+ETTh1:
+  anchor_clean:
+    max_input_contam: 0.03
+    max_target_contam: 0.0
+    forbid_target_validity: [corrupted, suspicious]
+  conservative_clean:
+    max_input_contam: 0.10
+    max_target_contam: 0.02
+    forbid_target_validity: [corrupted]
+  intervened:
+    forbid_unrecoverable_target: true
+
+ETTm1:
+  anchor_clean:
+    max_input_contam: 0.03
+    max_target_contam: 0.0
+    forbid_target_validity: [corrupted, suspicious]
+  conservative_clean:
+    max_input_contam: 0.10
+    max_target_contam: 0.02
+    forbid_target_validity: [corrupted]
+  intervened:
+    forbid_unrecoverable_target: true
+
+weather:
+  anchor_clean:
+    max_input_contam: 0.12
+    max_target_contam: 0.10
+    forbid_target_validity: [corrupted]
+  conservative_clean:
+    max_input_contam: 0.35
+    max_target_contam: 0.30
+    forbid_target_validity: []
+  intervened:
+    forbid_unrecoverable_target: true
+
+exchange_rate:
+  anchor_clean:
+    max_input_contam: 0.08
+    max_target_contam: 0.05
+    forbid_target_validity: [corrupted]
+  conservative_clean:
+    max_input_contam: 0.20
+    max_target_contam: 0.10
+    forbid_target_validity: []
+  intervened:
+    forbid_unrecoverable_target: true
+
+electricity:
+  anchor_clean:
+    max_input_contam: 0.12
+    max_target_contam: 0.08
+    forbid_target_validity: [corrupted]
+  conservative_clean:
+    max_input_contam: 0.30
+    max_target_contam: 0.20
+    forbid_target_validity: []
+  intervened:
+    forbid_unrecoverable_target: true

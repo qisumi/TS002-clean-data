@@ -1,0 +1,36 @@
+defaults:
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  train_view_name: raw
+  eval_views:
+    ETTh1: [raw, clean_like, intervened]
+    ETTh2: [raw, clean_like, intervened]
+    ETTm1: [raw, clean_like, intervened]
+    ETTm2: [raw, clean_like, intervened]
+    solar_AL: [raw, balanced, intervened]
+    weather: [raw, clean_like, intervened]
+    exchange_rate: [raw, clean_like, intervened]
+    electricity: [raw, clean_like, intervened]
+  runtime:
+    device: auto
+    batch_size: 128
+    eval_batch_size: 256
+    epochs: 12
+    patience: 3
+    lr: 0.001
+    weight_decay: 0.00001
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    max_train_windows: 15000
+    max_val_windows: 4000
+    max_test_windows:
+  model:
+    hidden_dim: 128
+    dropout: 0.1
+    hidden_layers: 2
+  feature:
+    near_zero_tolerance: 1.0e-8
+    flat_tolerance: 1.0e-8

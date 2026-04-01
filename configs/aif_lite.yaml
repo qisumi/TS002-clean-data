@@ -1,0 +1,112 @@
+defaults:
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  backbones:
+    - name: DLinear
+      params:
+        individual: false
+    - name: PatchTST
+      params:
+        individual: false
+        e_layers: 3
+        n_heads: 16
+        d_model: 128
+        d_ff: 256
+        dropout: 0.2
+        fc_dropout: 0.2
+        head_dropout: 0.0
+        patch_len: 16
+        stride: 8
+        padding_patch: end
+        revin: true
+        affine: true
+        subtract_last: false
+        decomposition: false
+        kernel_size: 25
+    - name: TQNet
+      params:
+        model_type: TQNet
+        d_model: 512
+        dropout: 0.0
+        use_revin: true
+    - name: iTransformer
+      params:
+        use_norm: true
+    - name: ModernTCN
+      params:
+        revin: true
+        affine: false
+        subtract_last: false
+        decomposition: false
+    - name: TimeMixer
+      params:
+        use_norm: true
+    - name: TimeMixerPP
+      params: {}
+  view_alias:
+    ETTh1:
+      clean_like: clean_like
+    ETTh2:
+      clean_like: clean_like
+    ETTm1:
+      clean_like: clean_like
+    ETTm2:
+      clean_like: clean_like
+    solar_AL:
+      clean_like: balanced
+    weather:
+      clean_like: clean_like
+    exchange_rate:
+      clean_like: clean_like
+    electricity:
+      clean_like: natural_clean
+  runtime:
+    device: auto
+    batch_size: 64
+    eval_batch_size: 128
+    epochs: 6
+    patience: 2
+    lr: 0.001
+    weight_decay: 0.00001
+    grad_clip: 1.0
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    max_train_windows: 12000
+    max_val_windows: 3000
+    max_test_windows:
+  loss:
+    alpha_cf_max: 0.5
+    beta_cons_max: 0.12
+    gamma_group_max: 0.15
+    eta: 2.0
+    warmup_epochs: 2
+    ramp_epochs: 2
+    severity_scale: 0.5
+    severity_clip: 3.0
+    group_tail_frac: 0.5
+    detach_cf_for_consistency: true
+    cf_batch_prob: 1.0
+    group_loss_mode: tail
+    backbone_overrides:
+      DLinear:
+        warmup_epochs: 4
+        ramp_epochs: 3
+        beta_cons_max: 0.08
+        gamma_group_max: 0.10
+        cf_batch_prob: 0.5
+        detach_cf_for_consistency: true
+      PatchTST:
+        warmup_epochs: 2
+        ramp_epochs: 2
+        beta_cons_max: 0.15
+        gamma_group_max: 0.15
+        cf_batch_prob: 1.0
+      TQNet:
+        warmup_epochs: 2
+        ramp_epochs: 2
+        beta_cons_max: 0.10
+        gamma_group_max: 0.12
+        cf_batch_prob: 0.8

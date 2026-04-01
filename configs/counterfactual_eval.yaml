@@ -1,0 +1,87 @@
+defaults:
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  backbones:
+    - name: DLinear
+      repo_candidates: [baseline/DLinear, external/DLinear, DLinear, vendor/DLinear]
+      params:
+        individual: false
+    - name: PatchTST
+      repo_candidates: [baseline/PatchTST, external/PatchTST, PatchTST, vendor/PatchTST]
+      params:
+        individual: false
+        e_layers: 3
+        n_heads: 16
+        d_model: 128
+        d_ff: 256
+        dropout: 0.2
+        fc_dropout: 0.2
+        head_dropout: 0.0
+        patch_len: 16
+        stride: 8
+        padding_patch: end
+        revin: true
+        affine: true
+        subtract_last: false
+        decomposition: false
+        kernel_size: 25
+    - name: TQNet
+      repo_candidates: [baseline/TQNet, external/TQNet, TQNet, vendor/TQNet]
+      params:
+        model_type: TQNet
+        d_model: 512
+        dropout: 0.0
+        use_revin: true
+    - name: iTransformer
+      repo_candidates: [baseline/iTransformer, external/iTransformer, iTransformer, vendor/iTransformer]
+      params:
+        use_norm: true
+    - name: ModernTCN
+      repo_candidates: [baseline/ModernTCN, external/ModernTCN, ModernTCN, vendor/ModernTCN]
+      params:
+        revin: true
+        affine: false
+        subtract_last: false
+        decomposition: false
+    - name: TimeMixer
+      repo_candidates: [baseline/TimeMixer, external/TimeMixer, TimeMixer, vendor/TimeMixer]
+      params:
+        use_norm: true
+    - name: TimeMixerPP
+      repo_candidates: [baseline/TimeMixerPP, external/TimeMixerPP, TimeMixerPP, vendor/TimeMixerPP]
+      params: {}
+  lookback: 96
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  direct_intervention_eval: true
+  runtime:
+    device: auto
+    batch_size: 64
+    eval_batch_size: 128
+    epochs: 8
+    patience: 3
+    lr: 0.001
+    weight_decay: 0.00001
+    grad_clip: 1.0
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    max_train_windows: 12000
+    max_val_windows: 3000
+    max_test_windows:
+  view_alias:
+    ETTh1:
+      clean_like: clean_like
+    ETTh2:
+      clean_like: clean_like
+    ETTm1:
+      clean_like: clean_like
+    ETTm2:
+      clean_like: clean_like
+    solar_AL:
+      clean_like: balanced
+    weather:
+      clean_like: clean_like
+    exchange_rate:
+      clean_like: clean_like
+    electricity:
+      clean_like: natural_clean

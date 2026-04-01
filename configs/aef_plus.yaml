@@ -1,0 +1,52 @@
+defaults:
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  eval_views:
+    ETTh1: [raw, clean_like, intervened]
+    ETTh2: [raw, clean_like, intervened]
+    ETTm1: [raw, clean_like, intervened]
+    ETTm2: [raw, clean_like, intervened]
+    solar_AL: [raw, balanced, intervened]
+    weather: [raw, clean_like, intervened]
+    exchange_rate: [raw, clean_like, intervened]
+    electricity: [raw, clean_like, intervened]
+  runtime:
+    device: auto
+    batch_size: 64
+    eval_batch_size: 128
+    epochs: 30
+    patience: 6
+    lr: 0.0003
+    weight_decay: 0.05
+    warmup_ratio: 0.05
+    grad_clip: 1.0
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    max_train_windows: 15000
+    max_val_windows: 4000
+    max_test_windows:
+    use_ema: true
+    ema_decay: 0.999
+  model:
+    d_model: 192
+    metadata_dim: 32
+    expert_hidden: 256
+    head_rank: 24
+    patch_len: 8
+    patch_stride: 4
+    n_blocks: 3
+    n_heads: 4
+    ffn_ratio: 3
+    dropout: 0.1
+    stochastic_depth: 0.05
+    num_experts: 4
+  loss:
+    lambda_group: 0.2
+    lambda_phase: 0.1
+    lambda_severity: 0.05
+  feature:
+    near_zero_tolerance: 1.0e-8
+    flat_tolerance: 1.0e-8
