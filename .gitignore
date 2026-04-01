@@ -50,3 +50,6 @@ Thumbs.db
 archive_not_for_handoff/
 ref_min/
 delete_now/
+*.err 
+*.out
+script_*.sh

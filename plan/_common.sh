@@ -54,8 +54,19 @@ find_conda_bin() {
   return 1
 }
 
+use_conda_runtime_libs() {
+  # Prefer the active conda env's libraries to avoid shared Anaconda CUDA/cuDNN conflicts.
+  if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib"
+  else
+    unset LD_LIBRARY_PATH
+  fi
+}
+
 ensure_conda_env() {
   if [[ "${CONDA_DEFAULT_ENV:-}" == "${CONDA_ENV_NAME}" ]]; then
+    use_conda_runtime_libs
+    plan_log "using conda env ${CONDA_ENV_NAME} runtime libs ${LD_LIBRARY_PATH:-<unset>}"
     return 0
   fi
 
@@ -77,7 +88,9 @@ ensure_conda_env() {
     return 1
   fi
 
+  use_conda_runtime_libs
   plan_log "activated conda env ${CONDA_ENV_NAME}"
+  plan_log "using conda env ${CONDA_ENV_NAME} runtime libs ${LD_LIBRARY_PATH:-<unset>}"
 }
 
 load_plan_arrays() {
@@ -225,6 +238,7 @@ write_dataset_shard_config() {
   if [[ -n "${PYTHONPATH:-}" ]]; then
     plan_pythonpath="${plan_pythonpath}:${PYTHONPATH}"
   fi
+  use_conda_runtime_libs
   plan_log "write shard config ${out_config} datasets=${datasets_csv} num_workers=${dataloader_workers}"
   PYTHONPATH="${plan_pythonpath}" "${PYTHON_BIN}" - "${base_config}" "${out_config}" "${datasets_csv}" "${dataloader_workers}" <<'PY'
 from __future__ import annotations
@@ -348,6 +362,7 @@ has_dataset() {
 }
 
 run_py() {
+  use_conda_runtime_libs
   plan_log "run ${PYTHON_BIN} $*"
   "${PYTHON_BIN}" "$@"
 }
@@ -359,6 +374,7 @@ run_module() {
   if [[ -n "${PYTHONPATH:-}" ]]; then
     plan_pythonpath="${plan_pythonpath}:${PYTHONPATH}"
   fi
+  use_conda_runtime_libs
   plan_log "run PYTHONPATH=${plan_pythonpath} ${PYTHON_BIN} -m ${module_name} $*"
   PYTHONPATH="${plan_pythonpath}" "${PYTHON_BIN}" -m "${module_name}" "$@"
 }
