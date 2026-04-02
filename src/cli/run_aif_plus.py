@@ -30,6 +30,7 @@ from experiments.aif_shared import (
     load_config,
     resolve_clean_view_name,
 )
+from utils.dataset_hparam_presets import resolve_aif_plus_dataset_config
 from utils.experiment_profiles import canonicalize_dataset_name
 from utils.forecasting_utils import (
     apply_intervention_recipe,
@@ -110,6 +111,19 @@ class ModelEMA:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.shadow.load_state_dict(state_dict)
+
+
+def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
+    raw_betas = runtime_cfg.get("betas", (0.9, 0.999))
+    if isinstance(raw_betas, (list, tuple)) and len(raw_betas) == 2:
+        return float(raw_betas[0]), float(raw_betas[1])
+    return 0.9, 0.999
+
+
+def router_balance_loss(router_weights: torch.Tensor) -> torch.Tensor:
+    importance = router_weights.mean(dim=0)
+    target = torch.full_like(importance, 1.0 / float(max(importance.numel(), 1)))
+    return F.mse_loss(importance, target)
 
 
 class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
@@ -550,6 +564,7 @@ def fit_stage(
         model.parameters(),
         lr=float(stage_cfg.get("lr", runtime_cfg.get("lr", 2e-4))),
         weight_decay=float(runtime_cfg.get("weight_decay", 0.05)),
+        betas=parse_optimizer_betas(runtime_cfg),
     )
     total_steps = max(1, epochs * len(train_loader))
     scheduler = build_scheduler(
@@ -571,15 +586,34 @@ def fit_stage(
     )
 
     lambda_pair = float(loss_cfg.get("alpha_pair", 0.2))
-    lambda_adv = float(loss_cfg.get("lambda_adv", 0.05))
     lambda_rec = float(loss_cfg.get("gamma_rec", 0.2))
     lambda_cvar = float(loss_cfg.get("delta_cvar", 0.15))
     lambda_orth = float(loss_cfg.get("lambda_orth", 1e-3))
+    lambda_router_balance = float(loss_cfg.get("lambda_router_balance", 0.0))
+    lambda_artifact_adv = float(loss_cfg.get("lambda_artifact_adv", loss_cfg.get("lambda_adv", 0.05)))
+    lambda_phase_adv = float(loss_cfg.get("lambda_phase_adv", loss_cfg.get("lambda_adv", 0.05)))
+    lambda_artifact_aux = float(loss_cfg.get("lambda_artifact_aux", loss_cfg.get("lambda_adv", 0.05)))
+    lambda_phase_aux = float(loss_cfg.get("lambda_phase_aux", loss_cfg.get("lambda_adv", 0.05)))
+    grl_alpha_final = float(loss_cfg.get("grl_alpha_final", 1.0))
+    grl_warmup_ratio = float(loss_cfg.get("grl_warmup_ratio", 0.0))
     tail_frac = float(loss_cfg.get("cvar_tail_frac", 0.2))
+    global_step = 0
+    warmup_steps = max(1, int(total_steps * max(grl_warmup_ratio, 0.0)))
 
     for epoch in range(1, epochs + 1):
         model.train()
         for batch in train_loader:
+            global_step += 1
+            if bool(stage_cfg.get("use_adv", False)):
+                if grl_alpha_final <= 0.0:
+                    model.grl.alpha = 0.0
+                elif grl_warmup_ratio > 0.0:
+                    model.grl.alpha = grl_alpha_final * min(1.0, float(global_step) / float(warmup_steps))
+                else:
+                    model.grl.alpha = grl_alpha_final
+            else:
+                model.grl.alpha = 0.0
+
             x_raw = batch["x_raw"].to(device, non_blocking=True)
             x_masked = batch["x_masked"].to(device, non_blocking=True)
             x_cf = batch["x_cf"].to(device, non_blocking=True)
@@ -615,6 +649,11 @@ def fit_stage(
                 if bool(stage_cfg.get("use_reconstruction", True)):
                     loss = loss + lambda_rec * rec_loss
 
+                balance_loss = pred.new_tensor(0.0)
+                if lambda_router_balance > 0.0:
+                    balance_loss = router_balance_loss(outputs["router_weights"])
+                    loss = loss + lambda_router_balance * balance_loss
+
                 pair_loss = pred.new_tensor(0.0)
                 if bool(stage_cfg.get("use_pair", False)) and bool(pair_available.any()):
                     cf_outputs = model(
@@ -631,13 +670,13 @@ def fit_stage(
 
                 adv_loss = pred.new_tensor(0.0)
                 if bool(stage_cfg.get("use_adv", False)):
-                    adv_loss = 0.25 * (
-                        F.cross_entropy(outputs["artifact_logits_clean"], artifact_id)
-                        + F.cross_entropy(outputs["phase_logits_clean"], phase_id)
-                        + F.cross_entropy(outputs["artifact_logits_art"], artifact_id)
-                        + F.cross_entropy(outputs["phase_logits_art"], phase_id)
+                    adv_loss = (
+                        lambda_artifact_adv * F.cross_entropy(outputs["artifact_logits_clean"], artifact_id)
+                        + lambda_phase_adv * F.cross_entropy(outputs["phase_logits_clean"], phase_id)
+                        + lambda_artifact_aux * F.cross_entropy(outputs["artifact_logits_art"], artifact_id)
+                        + lambda_phase_aux * F.cross_entropy(outputs["phase_logits_art"], phase_id)
                     )
-                    loss = loss + lambda_adv * adv_loss
+                    loss = loss + adv_loss
 
                 cvar_loss = pred.new_tensor(0.0)
                 if bool(stage_cfg.get("use_cvar", False)):
@@ -754,12 +793,6 @@ def main() -> None:
     args = parse_args()
     config = load_config(ROOT_DIR / Path(args.config))
     defaults = dict(config.get("defaults", {}))
-    runtime_cfg = dict(defaults.get("runtime", {}))
-    model_cfg = dict(defaults.get("model", {}))
-    loss_cfg = dict(defaults.get("loss", {}))
-    stage_cfg = dict(defaults.get("stages", {}))
-
-    lookback = int(defaults.get("lookback", 96))
     datasets = [canonicalize_dataset_name(str(name)) for name in defaults.get("datasets", [])]
     horizons = [int(item) for item in defaults.get("horizons", [])]
     seeds = [int(item) for item in defaults.get("seeds", [0])]
@@ -776,9 +809,16 @@ def main() -> None:
     error_frames: list[pd.DataFrame] = []
     bundle_cache: dict[str, Any] = {}
     events_cache: dict[str, dict[str, Any]] = {}
-    log_progress(f"start datasets={datasets} horizons={horizons} lookback={lookback}")
+    log_progress(f"start datasets={datasets} horizons={horizons}")
 
     for dataset_name in datasets:
+        dataset_cfg = resolve_aif_plus_dataset_config(defaults, dataset_name)
+        runtime_cfg = dict(dataset_cfg["runtime"])
+        model_cfg = dict(dataset_cfg["model"])
+        loss_cfg = dict(dataset_cfg["loss"])
+        stage_cfg = dict(dataset_cfg["stages"])
+        lookback = int(dataset_cfg["lookback"])
+        collapse_aux_label_vocabs = bool(dataset_cfg["collapse_aux_label_vocabs"])
         bundle_cache[dataset_name] = load_dataset_bundle(dataset_name, registry_path=registry_path)
         events_cache[dataset_name] = load_events_lookup(events_path=events_path, dataset_name=dataset_name)
         clean_view_name = resolve_clean_view_name(config, dataset_name)
@@ -813,14 +853,20 @@ def main() -> None:
                 horizon=horizon,
             )
             support_id_lookup = {split_name: support_vocab.get(status, 0) for split_name, status in support_status_lookup.items()}
-            artifact_map = build_lookup(
-                view_df["artifact_group_major"].fillna("NA").astype(str).tolist()
+            artifact_map = (
+                {"NA": 0}
+                if collapse_aux_label_vocabs
+                else build_lookup(view_df["artifact_group_major"].fillna("NA").astype(str).tolist())
             )
-            phase_map = build_lookup(
-                view_df.get("dominant_phase_input", view_df.get("dominant_phase_target", pd.Series(dtype=str)))
-                .fillna("NA")
-                .astype(str)
-                .tolist()
+            phase_map = (
+                {"NA": 0}
+                if collapse_aux_label_vocabs
+                else build_lookup(
+                    view_df.get("dominant_phase_input", view_df.get("dominant_phase_target", pd.Series(dtype=str)))
+                    .fillna("NA")
+                    .astype(str)
+                    .tolist()
+                )
             )
             group_map = build_group_map(train_raw_rows)
             metadata_context = {
@@ -1027,9 +1073,9 @@ def main() -> None:
                             "horizon": horizon,
                             "train_view_name": "aif_plus",
                             "eval_view_name": eval_view_name,
-                            "hyperparam_source_kind": "newplan_fixed",
-                            "hyperparam_source_url": "plan/newplan.md",
-                            "hyperparam_source_note": "AIF-Plus staged clean-view training",
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
                         },
                     )
                     result_rows.append(
@@ -1041,9 +1087,9 @@ def main() -> None:
                             "train_view_name": "aif_plus",
                             "eval_view_name": eval_view_name,
                             "seed": seed,
-                            "hyperparam_source_kind": "newplan_fixed",
-                            "hyperparam_source_url": "plan/newplan.md",
-                            "hyperparam_source_note": "AIF-Plus staged clean-view training",
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
                             "n_train_windows": int(len(train_clean_rows)),
                             "n_eval_windows": int(len(eval_rows)),
                             "best_val_mae": round(float(best_val_mae), 6),

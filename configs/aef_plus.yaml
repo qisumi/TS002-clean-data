@@ -3,6 +3,9 @@ defaults:
   horizons: [96, 192, 336, 720]
   seeds: [0]
   lookback: 96
+  use_dataset_presets: true
+  use_preset_lookback: false
+  aux_label_mode: public_benchmark
   eval_views:
     ETTh1: [raw, clean_like, intervened]
     ETTh2: [raw, clean_like, intervened]

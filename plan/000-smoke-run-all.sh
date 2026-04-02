@@ -146,6 +146,7 @@ aef_runtime["max_test_windows"] = 32
 dump_yaml(out_dir / "aef.smoke.yaml", aef)
 
 aef_plus = patch_eval_views(load_yaml(aef_plus_base))
+aef_plus.setdefault("defaults", {})["use_dataset_presets"] = False
 aef_plus_runtime = aef_plus.setdefault("defaults", {}).setdefault("runtime", {})
 aef_plus_runtime["epochs"] = 1
 aef_plus_runtime["patience"] = 1
@@ -160,6 +161,7 @@ dump_yaml(out_dir / "aef_plus.smoke.yaml", aef_plus)
 
 aif_plus = load_yaml(aif_plus_base)
 aif_defaults = aif_plus.setdefault("defaults", {})
+aif_defaults["use_dataset_presets"] = False
 aif_defaults["datasets"] = [dataset_name]
 aif_defaults["horizons"] = [horizon]
 aif_defaults["seeds"] = [seed]

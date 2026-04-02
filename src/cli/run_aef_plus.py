@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from data import ROOT_DIR, write_markdown
 from experiments.aef_shared import compare_with_standard
 from experiments.aif_shared import compute_aif_arg_table, compute_aif_wgr_table
+from utils.dataset_hparam_presets import resolve_aef_plus_dataset_config
 from utils.experiment_profiles import canonicalize_dataset_name
 from utils.forecasting_utils import (
     apply_intervention_recipe,
@@ -76,6 +77,19 @@ class ModelEMA:
                 value.copy_(source)
                 continue
             value.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
+
+
+def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
+    raw_betas = runtime_cfg.get("betas", (0.9, 0.999))
+    if isinstance(raw_betas, (list, tuple)) and len(raw_betas) == 2:
+        return float(raw_betas[0]), float(raw_betas[1])
+    return 0.9, 0.999
+
+
+def router_balance_loss(router_weights: torch.Tensor) -> torch.Tensor:
+    importance = router_weights.mean(dim=0)
+    target = torch.full_like(importance, 1.0 / float(max(importance.numel(), 1)))
+    return F.mse_loss(importance, target)
 
 
 class AEFPlusWindowDataset(Dataset[dict[str, Any]]):
@@ -388,6 +402,7 @@ def fit_aef_plus(
         model.parameters(),
         lr=float(runtime_cfg.get("lr", 3e-4)),
         weight_decay=float(runtime_cfg.get("weight_decay", 0.05)),
+        betas=parse_optimizer_betas(runtime_cfg),
     )
     scheduler = build_scheduler(
         optimizer=optimizer,
@@ -408,6 +423,7 @@ def fit_aef_plus(
     lambda_group = float(loss_cfg.get("lambda_group", 0.2))
     lambda_phase = float(loss_cfg.get("lambda_phase", 0.1))
     lambda_severity = float(loss_cfg.get("lambda_severity", 0.05))
+    lambda_router_balance = float(loss_cfg.get("lambda_router_balance", 0.0))
 
     for epoch in range(1, int(runtime_cfg.get("epochs", 30)) + 1):
         model.train()
@@ -437,7 +453,16 @@ def fit_aef_plus(
                 group_loss = F.cross_entropy(outputs["group_logits"], artifact_id)
                 phase_loss = F.cross_entropy(outputs["phase_logits"], phase_id)
                 severity_loss = F.smooth_l1_loss(outputs["severity_pred"], severity_target)
-                loss = pred_loss + lambda_group * group_loss + lambda_phase * phase_loss + lambda_severity * severity_loss
+                balance_loss = pred_loss.new_tensor(0.0)
+                if lambda_router_balance > 0.0:
+                    balance_loss = router_balance_loss(outputs["router_weights"])
+                loss = (
+                    pred_loss
+                    + lambda_router_balance * balance_loss
+                    + lambda_group * group_loss
+                    + lambda_phase * phase_loss
+                    + lambda_severity * severity_loss
+                )
 
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -538,11 +563,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(ROOT_DIR / Path(args.config))
     defaults = dict(config.get("defaults", {}))
-    runtime_cfg = dict(defaults.get("runtime", {}))
-    model_cfg = dict(defaults.get("model", {}))
     feature_cfg = dict(defaults.get("feature", {}))
-    loss_cfg = dict(defaults.get("loss", {}))
-    lookback = int(defaults.get("lookback", 96))
 
     datasets = [canonicalize_dataset_name(str(name)) for name in defaults.get("datasets", [])]
     horizons = [int(item) for item in defaults.get("horizons", [])]
@@ -557,9 +578,15 @@ def main() -> None:
     events_cache: dict[str, dict[str, Any]] = {}
     result_rows: list[dict[str, Any]] = []
     error_frames: list[pd.DataFrame] = []
-    log_progress(f"start datasets={datasets} horizons={horizons} lookback={lookback}")
+    log_progress(f"start datasets={datasets} horizons={horizons}")
 
     for dataset_name in datasets:
+        dataset_cfg = resolve_aef_plus_dataset_config(defaults, dataset_name)
+        runtime_cfg = dict(dataset_cfg["runtime"])
+        model_cfg = dict(dataset_cfg["model"])
+        loss_cfg = dict(dataset_cfg["loss"])
+        lookback = int(dataset_cfg["lookback"])
+        collapse_aux_label_vocabs = bool(dataset_cfg["collapse_aux_label_vocabs"])
         bundle_cache[dataset_name] = load_dataset_bundle(dataset_name, registry_path=registry_path)
         events_cache[dataset_name] = load_events_lookup(events_path=events_path, dataset_name=dataset_name)
         for horizon in horizons:
@@ -586,14 +613,26 @@ def main() -> None:
                 log_progress(f"skip dataset={dataset_name} L{lookback} H{horizon} due to empty train/val rows")
                 continue
 
-            artifact_map = build_lookup(view_df["artifact_group_major"].fillna("NA").astype(str).tolist())
-            phase_map = build_lookup(
-                view_df.get("dominant_phase_input", view_df.get("dominant_phase_target", pd.Series(dtype=str)))
-                .fillna("NA")
-                .astype(str)
-                .tolist()
+            artifact_map = (
+                {"NA": 0}
+                if collapse_aux_label_vocabs
+                else build_lookup(view_df["artifact_group_major"].fillna("NA").astype(str).tolist())
             )
-            severity_map = build_lookup(view_df["severity_bin"].fillna("none").astype(str).tolist())
+            phase_map = (
+                {"NA": 0}
+                if collapse_aux_label_vocabs
+                else build_lookup(
+                    view_df.get("dominant_phase_input", view_df.get("dominant_phase_target", pd.Series(dtype=str)))
+                    .fillna("NA")
+                    .astype(str)
+                    .tolist()
+                )
+            )
+            severity_map = (
+                {"none": 0}
+                if collapse_aux_label_vocabs
+                else build_lookup(view_df["severity_bin"].fillna("none").astype(str).tolist())
+            )
             nvar_map = build_lookup(view_df["n_variables_bin"].fillna("NA").astype(str).tolist())
 
             for seed in seeds:
@@ -621,7 +660,7 @@ def main() -> None:
                         dropout=float(model_cfg.get("dropout", 0.1)),
                         stochastic_depth=float(model_cfg.get("stochastic_depth", 0.05)),
                         num_experts=int(model_cfg.get("num_experts", 4)),
-                        max_boundary_steps=min(96, max(4, lookback // 4)),
+                        max_boundary_steps=max(96, int(model_cfg.get("max_boundary_steps", 96))),
                     )
                 )
                 device = resolve_device(str(runtime_cfg.get("device", "auto")))
@@ -718,9 +757,9 @@ def main() -> None:
                             "horizon": horizon,
                             "train_view_name": "aef_plus",
                             "eval_view_name": str(eval_view_name),
-                            "hyperparam_source_kind": "newplan_fixed",
-                            "hyperparam_source_url": "plan/newplan.md",
-                            "hyperparam_source_note": "AEF-Plus exploit upper-bound training",
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
                         },
                     )
                     result_rows.append(
@@ -732,9 +771,9 @@ def main() -> None:
                             "train_view_name": "aef_plus",
                             "eval_view_name": str(eval_view_name),
                             "seed": seed,
-                            "hyperparam_source_kind": "newplan_fixed",
-                            "hyperparam_source_url": "plan/newplan.md",
-                            "hyperparam_source_note": "AEF-Plus exploit upper-bound training",
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
                             "n_train_windows": int(len(train_rows)),
                             "n_eval_windows": int(len(eval_rows)),
                             "best_val_mae": round(float(best_val_mae), 6),

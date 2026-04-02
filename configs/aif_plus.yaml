@@ -3,6 +3,9 @@ defaults:
   horizons: [96, 192, 336, 720]
   seeds: [0]
   lookback: 96
+  use_dataset_presets: true
+  use_preset_lookback: false
+  aux_label_mode: public_benchmark
   view_alias:
     ETTh1:
       clean_like: clean_like
@@ -63,7 +66,7 @@ defaults:
       epochs: 4
       lr: 0.0002
       patience: 2
-      use_forecast_loss: false
+      use_forecast_loss: true
       use_reconstruction: true
       use_pair: false
       use_adv: false
@@ -86,7 +89,7 @@ defaults:
       patience: 3
       use_forecast_loss: true
       use_reconstruction: true
-      use_pair: true
+      use_pair: false
       use_adv: true
-      use_cvar: true
-      use_orth: true
+      use_cvar: false
+      use_orth: false

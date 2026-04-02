@@ -360,7 +360,7 @@ class AEFPlus(nn.Module):
             ffn_ratio=int(config.ffn_ratio),
             dropout=float(config.dropout),
             stochastic_depth=float(config.stochastic_depth),
-            max_boundary_steps=min(int(config.max_boundary_steps), max(8, self.seq_len // 2)),
+            max_boundary_steps=max(1, int(config.max_boundary_steps)),
             metadata_num_dim=int(config.metadata_num_dim),
             metadata_dim=int(config.metadata_dim),
             artifact_vocab_size=int(config.artifact_vocab_size),
