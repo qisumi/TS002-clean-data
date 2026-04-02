@@ -385,7 +385,7 @@ def fit_aef_plus(
     loss_cfg: dict[str, Any],
     seed: int,
     log_prefix: str,
-) -> tuple[float, float, int]:
+) -> tuple[float, float, float, int]:
     set_random_seed(seed)
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
@@ -412,6 +412,7 @@ def fit_aef_plus(
     grad_clip = float(runtime_cfg.get("grad_clip", 1.0))
     best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
     best_val_mae = float("inf")
+    best_val_mse = float("inf")
     best_val_gap = float("-inf")
     patience_counter = 0
     epochs_ran = 0
@@ -449,10 +450,10 @@ def fit_aef_plus(
                     nvar_bin_id=nvar_bin_id,
                     horizon_id=horizon_id,
                 )
-                pred_loss = F.l1_loss(outputs["pred"], y)
+                pred_loss = F.mse_loss(outputs["pred"], y)
                 group_loss = F.cross_entropy(outputs["group_logits"], artifact_id)
                 phase_loss = F.cross_entropy(outputs["phase_logits"], phase_id)
-                severity_loss = F.smooth_l1_loss(outputs["severity_pred"], severity_target)
+                severity_loss = F.mse_loss(outputs["severity_pred"], severity_target)
                 balance_loss = pred_loss.new_tensor(0.0)
                 if lambda_router_balance > 0.0:
                     balance_loss = router_balance_loss(outputs["router_weights"])
@@ -488,17 +489,20 @@ def fit_aef_plus(
             val_intervened_mae = float(val_intervened_metrics["mae"])
             val_gap = float(val_intervened_mae - float(val_raw_metrics["mae"]))
         epochs_ran = epoch
-        current_val = float(val_raw_metrics["mae"])
+        current_val_mae = float(val_raw_metrics["mae"])
+        current_val_mse = float(val_raw_metrics["mse"])
         log_progress(
             f"{log_prefix} epoch {epoch}/{int(runtime_cfg.get('epochs', 30))} "
-            f"val_raw_mae={current_val:.6f} best_val_mae={min(best_val_mae, current_val):.6f} "
+            f"val_raw_mse={current_val_mse:.6f} best_val_mse={min(best_val_mse, current_val_mse):.6f} "
+            f"val_raw_mae={current_val_mae:.6f} "
             f"val_gap={val_gap if math.isfinite(val_gap) else float('nan'):.6f}"
         )
 
-        better_raw = current_val + 1e-6 < best_val_mae
-        tie_better_gap = abs(current_val - best_val_mae) <= 1e-6 and val_gap > best_val_gap + 1e-6
+        better_raw = current_val_mse + 1e-6 < best_val_mse
+        tie_better_gap = abs(current_val_mse - best_val_mse) <= 1e-6 and val_gap > best_val_gap + 1e-6
         if better_raw or tie_better_gap:
-            best_val_mae = current_val
+            best_val_mse = current_val_mse
+            best_val_mae = current_val_mae
             best_val_gap = val_gap
             best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
             patience_counter = 0
@@ -513,10 +517,11 @@ def fit_aef_plus(
     else:
         model.load_state_dict(best_state)
     log_progress(
-        f"{log_prefix} fit done epochs_ran={epochs_ran} best_val_mae={best_val_mae:.6f} "
+        f"{log_prefix} fit done epochs_ran={epochs_ran} best_val_mse={best_val_mse:.6f} "
+        f"best_val_mae={best_val_mae:.6f} "
         f"best_val_gap={best_val_gap if math.isfinite(best_val_gap) else float('nan'):.6f}"
     )
-    return best_val_mae, best_val_gap, epochs_ran
+    return best_val_mse, best_val_mae, best_val_gap, epochs_ran
 
 
 def build_summary_markdown(
@@ -711,7 +716,7 @@ def main() -> None:
                     else None
                 )
 
-                best_val_mae, best_val_gap, epochs_ran = fit_aef_plus(
+                best_val_mse, best_val_mae, best_val_gap, epochs_ran = fit_aef_plus(
                     model=model,
                     ema=ema,
                     train_dataset=train_dataset,
@@ -777,6 +782,7 @@ def main() -> None:
                             "n_train_windows": int(len(train_rows)),
                             "n_eval_windows": int(len(eval_rows)),
                             "best_val_mae": round(float(best_val_mae), 6),
+                            "best_val_mse": round(float(best_val_mse), 6),
                             "best_val_gap": round(float(best_val_gap), 6) if math.isfinite(best_val_gap) else np.nan,
                             "epochs_ran": int(epochs_ran),
                             "mae": round(float(metrics["mae"]), 6),

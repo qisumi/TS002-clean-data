@@ -207,6 +207,7 @@ def main() -> None:
                             "hyperparam_source_url": str(resolved.source_url),
                             "hyperparam_source_note": str(resolved.source_note),
                             "best_val_mae": round(float(artifacts.best_val_mae), 6),
+                            "best_val_mse": round(float(artifacts.best_val_mse), 6),
                             "epochs_ran": int(artifacts.epochs_ran),
                             "fit_seconds": round(float(artifacts.fit_seconds), 3),
                             "mae_raw": round(float(raw_metrics["mae"]), 6),

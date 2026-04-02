@@ -25,6 +25,7 @@ class TrainArtifacts:
     train_view_name: str
     val_view_name: str
     best_val_mae: float
+    best_val_mse: float
     epochs_ran: int
     device: str
     fit_seconds: float
@@ -100,6 +101,7 @@ def fit_forecaster(
 
     best_state: dict[str, Any] | None = None
     best_val_mae = float("inf")
+    best_val_mse = float("inf")
     patience_counter = 0
     epochs_ran = 0
     fit_start = time.perf_counter()
@@ -138,13 +140,18 @@ def fit_forecaster(
             log_prefix=f"{prefix}val",
         )
         val_mae = float(val_metrics["mae"])
+        val_mse = float(val_metrics["mse"])
         epochs_ran = epoch
         log_progress(
-            f"{prefix}epoch {epoch}/{epochs} val_mae={val_mae:.6f} best_val_mae={min(best_val_mae, val_mae):.6f}",
+            f"{prefix}epoch {epoch}/{epochs} val_mse={val_mse:.6f} best_val_mse={min(best_val_mse, val_mse):.6f} "
+            f"val_mae={val_mae:.6f}",
             log_path=log_path,
         )
 
-        if val_mae + 1e-6 < best_val_mae:
+        better_mse = val_mse + 1e-6 < best_val_mse
+        tie_better_mae = abs(val_mse - best_val_mse) <= 1e-6 and val_mae + 1e-6 < best_val_mae
+        if better_mse or tie_better_mae:
+            best_val_mse = val_mse
             best_val_mae = val_mae
             best_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
@@ -162,7 +169,7 @@ def fit_forecaster(
     fit_seconds = time.perf_counter() - fit_start
     log_progress(
         f"{prefix}fit_forecaster done backbone={backbone_name} epochs_ran={epochs_ran} "
-        f"best_val_mae={best_val_mae:.6f} fit_seconds={fit_seconds:.2f}",
+        f"best_val_mse={best_val_mse:.6f} best_val_mae={best_val_mae:.6f} fit_seconds={fit_seconds:.2f}",
         log_path=log_path,
     )
     return TrainArtifacts(
@@ -170,6 +177,7 @@ def fit_forecaster(
         train_view_name=train_view_name,
         val_view_name=val_view_name,
         best_val_mae=float(best_val_mae),
+        best_val_mse=float(best_val_mse),
         epochs_ran=epochs_ran,
         device=str(device),
         fit_seconds=float(round(fit_seconds, 3)),

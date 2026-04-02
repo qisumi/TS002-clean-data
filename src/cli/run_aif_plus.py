@@ -377,8 +377,8 @@ def orthogonality_loss(z_clean: torch.Tensor, z_art: torch.Tensor) -> torch.Tens
     return cross.pow(2).mean()
 
 
-def masked_l1_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return ((pred - target).abs() * mask).sum() / mask.sum().clamp_min(1.0)
+def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (((pred - target) ** 2) * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float) -> LambdaLR:
@@ -552,7 +552,7 @@ def fit_stage(
     horizon_id: int,
     seed: int,
     log_prefix: str,
-) -> tuple[float, int]:
+) -> tuple[float, float, int]:
     epochs = int(stage_cfg.get("epochs", 0))
     if epochs <= 0 or len(train_loader.dataset) == 0:
         return float("inf"), 0
@@ -577,6 +577,7 @@ def fit_stage(
 
     best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
     best_val_mae = float("inf")
+    best_val_mse = float("inf")
     epochs_ran = 0
     patience_counter = 0
     set_random_seed(seed)
@@ -642,10 +643,10 @@ def fit_stage(
                     horizon_id=horizon_tensor,
                 )
                 pred = outputs["pred"]
-                per_sample_mae = F.l1_loss(pred, y, reduction="none").mean(dim=(1, 2))
-                loss = per_sample_mae.mean() if bool(stage_cfg.get("use_forecast_loss", True)) else pred.new_tensor(0.0)
+                per_sample_mse = F.mse_loss(pred, y, reduction="none").mean(dim=(1, 2))
+                loss = per_sample_mse.mean() if bool(stage_cfg.get("use_forecast_loss", True)) else pred.new_tensor(0.0)
 
-                rec_loss = masked_l1_loss(outputs["reconstruction"], rec_target, rec_mask)
+                rec_loss = masked_mse_loss(outputs["reconstruction"], rec_target, rec_mask)
                 if bool(stage_cfg.get("use_reconstruction", True)):
                     loss = loss + lambda_rec * rec_loss
 
@@ -665,7 +666,7 @@ def fit_stage(
                         support_id=support_id,
                         horizon_id=horizon_tensor,
                     )
-                    pair_loss = (pred[pair_available] - cf_outputs["pred"][pair_available]).abs().mean()
+                    pair_loss = ((pred[pair_available] - cf_outputs["pred"][pair_available]) ** 2).mean()
                     loss = loss + lambda_pair * pair_loss
 
                 adv_loss = pred.new_tensor(0.0)
@@ -680,7 +681,7 @@ def fit_stage(
 
                 cvar_loss = pred.new_tensor(0.0)
                 if bool(stage_cfg.get("use_cvar", False)):
-                    cvar_loss = group_tail_mean(per_sample_mae, group_id, tail_frac=tail_frac, round_up=True)
+                    cvar_loss = group_tail_mean(per_sample_mse, group_id, tail_frac=tail_frac, round_up=True)
                     loss = loss + lambda_cvar * cvar_loss
 
                 orth_loss = pred.new_tensor(0.0)
@@ -717,13 +718,17 @@ def fit_stage(
             setting_meta={},
         )
         epochs_ran = epoch
-        current_val = float(val_metrics["mae"])
+        current_val_mae = float(val_metrics["mae"])
+        current_val_mse = float(val_metrics["mse"])
         log_progress(
-            f"{log_prefix} stage={stage_name} epoch {epoch}/{epochs} val_clean_mae={current_val:.6f} "
-            f"best_val_mae={min(best_val_mae, current_val):.6f}"
+            f"{log_prefix} stage={stage_name} epoch {epoch}/{epochs} val_clean_mse={current_val_mse:.6f} "
+            f"best_val_mse={min(best_val_mse, current_val_mse):.6f} val_clean_mae={current_val_mae:.6f}"
         )
-        if current_val + 1e-6 < best_val_mae:
-            best_val_mae = current_val
+        better_mse = current_val_mse + 1e-6 < best_val_mse
+        tie_better_mae = abs(current_val_mse - best_val_mse) <= 1e-6 and current_val_mae + 1e-6 < best_val_mae
+        if better_mse or tie_better_mae:
+            best_val_mse = current_val_mse
+            best_val_mae = current_val_mae
             best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
             patience_counter = 0
         else:
@@ -736,8 +741,11 @@ def fit_stage(
         model.load_state_dict(best_state)
     else:
         model.load_state_dict(best_state)
-    log_progress(f"{log_prefix} stage={stage_name} done epochs_ran={epochs_ran} best_val_mae={best_val_mae:.6f}")
-    return best_val_mae, epochs_ran
+    log_progress(
+        f"{log_prefix} stage={stage_name} done epochs_ran={epochs_ran} "
+        f"best_val_mse={best_val_mse:.6f} best_val_mae={best_val_mae:.6f}"
+    )
+    return best_val_mse, best_val_mae, epochs_ran
 
 
 def build_summary_markdown(
@@ -973,7 +981,7 @@ def main() -> None:
                 )
 
                 log_prefix = f"{dataset_name}/L{lookback}/H{horizon}/seed{seed}"
-                _, stage_a_epochs = fit_stage(
+                _, _, stage_a_epochs = fit_stage(
                     stage_name="stage_a",
                     model=model,
                     ema=ema,
@@ -994,7 +1002,7 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
-                best_val_mae, stage_b_epochs = fit_stage(
+                best_val_mse, best_val_mae, stage_b_epochs = fit_stage(
                     stage_name="stage_b",
                     model=model,
                     ema=ema,
@@ -1015,7 +1023,7 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
-                best_val_mae, stage_c_epochs = fit_stage(
+                best_val_mse, best_val_mae, stage_c_epochs = fit_stage(
                     stage_name="stage_c",
                     model=model,
                     ema=ema,
@@ -1093,6 +1101,7 @@ def main() -> None:
                             "n_train_windows": int(len(train_clean_rows)),
                             "n_eval_windows": int(len(eval_rows)),
                             "best_val_mae": round(float(best_val_mae), 6),
+                            "best_val_mse": round(float(best_val_mse), 6),
                             "stage_a_epochs_ran": int(stage_a_epochs),
                             "stage_b_epochs_ran": int(stage_b_epochs),
                             "stage_c_epochs_ran": int(stage_c_epochs),
