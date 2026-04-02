@@ -62,7 +62,7 @@ AIFPlusConfig = _AIFPLUS_MODULE.AIFPlusConfig
 
 
 def log_progress(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] [009/AIF+] {message}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] [AIF+] {message}", flush=True)
 
 
 VIEW_FLAG_COLUMNS = {
@@ -354,7 +354,7 @@ def parse_args() -> argparse.Namespace:
 
 def orthogonality_loss(z_clean: torch.Tensor, z_art: torch.Tensor) -> torch.Tensor:
     if z_clean.shape[0] <= 1:
-        return z_clean.new_tensor(0.0)
+        return (z_clean.sum() + z_art.sum()) * 0.0
     z_clean_centered = z_clean - z_clean.mean(dim=0, keepdim=True)
     z_art_centered = z_art - z_art.mean(dim=0, keepdim=True)
     z_clean_norm = F.normalize(z_clean_centered, dim=-1)
@@ -364,8 +364,6 @@ def orthogonality_loss(z_clean: torch.Tensor, z_art: torch.Tensor) -> torch.Tens
 
 
 def masked_l1_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    if float(mask.sum().item()) <= 0:
-        return pred.new_tensor(0.0)
     return ((pred - target).abs() * mask).sum() / mask.sum().clamp_min(1.0)
 
 

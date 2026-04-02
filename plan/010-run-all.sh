@@ -31,9 +31,40 @@ STEP_SCRIPTS=(
   "005-run-etth2-support-boundary.sh"
   "006-run-aef-baselines.sh"
   "007-run-aef-plus.sh"
-  "08-run-aif-plus.sh"
-  "09-build-final-reports.sh"
+  "008-run-aif-plus.sh"
+  "009-build-final-reports.sh"
 )
+
+print_usage() {
+  cat <<'EOF'
+Usage:
+  bash plan/010-run-all.sh [--from STEP] [--to STEP] [--only STEPS] [--skip-done]
+  bash plan/010-run-all.sh [STEP]
+
+Options:
+  --from STEP      Start from the given step, e.g. 008 or 008-run-aif-plus.sh
+  --to STEP        Stop at the given step
+  --only STEPS     Run only the listed steps, comma-separated or space-separated
+  --skip-done      Skip steps whose .ok marker already exists
+  --list           Print available steps and exit
+  -h, --help       Show this help message
+
+Examples:
+  bash plan/010-run-all.sh --from 008
+  bash plan/010-run-all.sh 008
+  bash plan/010-run-all.sh --only 008,009
+  bash plan/010-run-all.sh --from 008 --skip-done
+
+Environment variables PLAN_FROM / PLAN_TO / PLAN_ONLY / PLAN_SKIP_DONE are still supported.
+EOF
+}
+
+list_steps() {
+  local step_script
+  for step_script in "${STEP_SCRIPTS[@]}"; do
+    printf '%s\n' "${step_script}"
+  done
+}
 
 normalize_step_list() {
   local raw_text="$1"
@@ -41,11 +72,103 @@ normalize_step_list() {
   printf '%s\n' "${raw_text}"
 }
 
+step_rank() {
+  local token="$1"
+  token="${token##*/}"
+  token="${token%.sh}"
+  token="${token%%-*}"
+  [[ "${token}" =~ ^[0-9]+$ ]] || return 1
+  printf '%d\n' "$((10#${token}))"
+}
+
+validate_step_token() {
+  local label="$1"
+  local token="$2"
+  if ! step_rank "${token}" >/dev/null; then
+    plan_log "invalid ${label}: ${token}"
+    return 1
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        shift
+        [[ $# -gt 0 ]] || { plan_log "--from requires a step"; return 1; }
+        PLAN_FROM="$1"
+        ;;
+      --to)
+        shift
+        [[ $# -gt 0 ]] || { plan_log "--to requires a step"; return 1; }
+        PLAN_TO="$1"
+        ;;
+      --only)
+        shift
+        [[ $# -gt 0 ]] || { plan_log "--only requires step list"; return 1; }
+        PLAN_ONLY="$1"
+        ;;
+      --skip-done)
+        PLAN_SKIP_DONE=1
+        ;;
+      --list)
+        list_steps
+        exit 0
+        ;;
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        plan_log "unknown argument: $1"
+        print_usage >&2
+        return 1
+        ;;
+      *)
+        if [[ -n "${PLAN_FROM}" ]]; then
+          plan_log "unexpected positional argument: $1"
+          print_usage >&2
+          return 1
+        fi
+        PLAN_FROM="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -n "${PLAN_FROM}" ]]; then
+    validate_step_token "PLAN_FROM" "${PLAN_FROM}" || return 1
+    PLAN_FROM="$(step_rank "${PLAN_FROM}")"
+  fi
+  if [[ -n "${PLAN_TO}" ]]; then
+    validate_step_token "PLAN_TO" "${PLAN_TO}" || return 1
+    PLAN_TO="$(step_rank "${PLAN_TO}")"
+  fi
+  if [[ -n "${PLAN_ONLY}" ]]; then
+    local token
+    for token in $(normalize_step_list "${PLAN_ONLY}"); do
+      validate_step_token "PLAN_ONLY token" "${token}" || return 1
+    done
+  fi
+
+  if [[ -n "${PLAN_FROM}" && -n "${PLAN_TO}" ]] && (( 10#${PLAN_FROM} > 10#${PLAN_TO} )); then
+    plan_log "PLAN_FROM must be <= PLAN_TO"
+    return 1
+  fi
+}
+
 step_id_matches() {
   local step_id="$1"
   local token="$2"
-  [[ "${token}" =~ ^[0-9]+$ ]] || return 1
-  (( 10#${step_id} == 10#${token} ))
+  local step_rank_value
+  local token_rank_value
+  step_rank_value="$(step_rank "${step_id}")" || return 1
+  token_rank_value="$(step_rank "${token}")" || return 1
+  (( step_rank_value == token_rank_value ))
 }
 
 step_selected() {
@@ -69,6 +192,8 @@ step_selected() {
   return 0
 }
 
+parse_args "$@"
+
 plan_log "logs=${PLAN_LOG_DIR_ABS}"
 plan_log "conda_env=${CONDA_DEFAULT_ENV:-<unset>}"
 plan_log "python=$(command -v "${PYTHON_BIN}")"
@@ -76,6 +201,7 @@ plan_log "gpus=$(join_by_comma "${PLAN_GPU_IDS_ARR[@]}")"
 plan_log "cpu_cores=$(resolve_plan_cpu_cores)"
 plan_log "cpu_threads_per_worker=${PLAN_CPU_THREADS_PER_WORKER:-auto}"
 plan_log "dataloader_workers_per_proc=$(resolve_plan_dataloader_workers)"
+plan_log "selectors from=${PLAN_FROM:-<unset>} to=${PLAN_TO:-<unset>} only=${PLAN_ONLY:-<unset>} skip_done=${PLAN_SKIP_DONE}"
 
 for step_script in "${STEP_SCRIPTS[@]}"; do
   step_id="${step_script%%-*}"

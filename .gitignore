@@ -53,3 +53,7 @@ delete_now/
 *.err 
 *.out
 script_*.sh
+reports/
+statistic_results/
+.*/
+temp/

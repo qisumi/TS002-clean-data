@@ -62,7 +62,7 @@ for ((worker_idx = 0; worker_idx < PLAN_AIF_PLUS_WORKER_COUNT; worker_idx++)); d
     "aif-plus-shard-${worker_idx}" \
     "${gpu_id}" \
     "${PLAN_AIF_PLUS_THREADS}" \
-    "$(plan_child_log_path "08-aif-plus-shard-${worker_idx}")" \
+    "$(plan_child_log_path "008-aif-plus-shard-${worker_idx}")" \
     cli.run_aif_plus \
     --config "${shard_config}" \
     --views-dir "${STATS_DIR}/window_views" \
@@ -78,7 +78,10 @@ for ((worker_idx = 0; worker_idx < PLAN_AIF_PLUS_WORKER_COUNT; worker_idx++)); d
     --report-out "${shard_dir}/aif_plus_summary.md"
 done
 
-plan_wait_bg
+if ! plan_wait_bg; then
+  plan_log "one or more AIF-Plus shards failed; skip merge"
+  exit 1
+fi
 
 plan_log "merge AIF-Plus shard outputs"
 PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" "${PYTHON_BIN}" - \
