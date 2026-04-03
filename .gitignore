@@ -50,6 +50,8 @@ Thumbs.db
 archive_not_for_handoff/
 ref_min/
 delete_now/
+chatgpt_upload_bundle/
+chatgpt_upload_bundle.zip
 *.err 
 *.out
 script_*.sh
