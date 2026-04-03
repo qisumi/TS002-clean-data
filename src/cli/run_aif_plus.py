@@ -366,6 +366,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_experiment_meta(defaults: dict[str, Any]) -> dict[str, str]:
+    display_name = str(defaults.get("experiment_name", "AIF-Plus")).strip() or "AIF-Plus"
+    backbone_name = str(defaults.get("backbone_name", "AIFPlus")).strip() or "AIFPlus"
+    train_view_name = str(defaults.get("train_view_name", "aif_plus")).strip() or "aif_plus"
+    summary_title = str(defaults.get("summary_title", f"{display_name} Summary")).strip() or f"{display_name} Summary"
+    summary_note = str(defaults.get("summary_note", "")).strip()
+    return {
+        "display_name": display_name,
+        "backbone_name": backbone_name,
+        "train_view_name": train_view_name,
+        "summary_title": summary_title,
+        "summary_note": summary_note,
+    }
+
+
 def orthogonality_loss(z_clean: torch.Tensor, z_art: torch.Tensor) -> torch.Tensor:
     if z_clean.shape[0] <= 1:
         return (z_clean.sum() + z_art.sum()) * 0.0
@@ -555,7 +570,7 @@ def fit_stage(
 ) -> tuple[float, float, int]:
     epochs = int(stage_cfg.get("epochs", 0))
     if epochs <= 0 or len(train_loader.dataset) == 0:
-        return float("inf"), 0
+        return float("inf"), float("inf"), 0
 
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
@@ -590,7 +605,6 @@ def fit_stage(
     lambda_rec = float(loss_cfg.get("gamma_rec", 0.2))
     lambda_cvar = float(loss_cfg.get("delta_cvar", 0.15))
     lambda_orth = float(loss_cfg.get("lambda_orth", 1e-3))
-    lambda_router_balance = float(loss_cfg.get("lambda_router_balance", 0.0))
     lambda_artifact_adv = float(loss_cfg.get("lambda_artifact_adv", loss_cfg.get("lambda_adv", 0.05)))
     lambda_phase_adv = float(loss_cfg.get("lambda_phase_adv", loss_cfg.get("lambda_adv", 0.05)))
     lambda_artifact_aux = float(loss_cfg.get("lambda_artifact_aux", loss_cfg.get("lambda_adv", 0.05)))
@@ -651,9 +665,9 @@ def fit_stage(
                     loss = loss + lambda_rec * rec_loss
 
                 balance_loss = pred.new_tensor(0.0)
-                if lambda_router_balance > 0.0:
+                if "router_weights" in outputs and float(loss_cfg.get("lambda_router_balance", 0.0)) > 0.0:
                     balance_loss = router_balance_loss(outputs["router_weights"])
-                    loss = loss + lambda_router_balance * balance_loss
+                    loss = loss + float(loss_cfg.get("lambda_router_balance", 0.0)) * balance_loss
 
                 pair_loss = pred.new_tensor(0.0)
                 if bool(stage_cfg.get("use_pair", False)) and bool(pair_available.any()):
@@ -721,12 +735,13 @@ def fit_stage(
         current_val_mae = float(val_metrics["mae"])
         current_val_mse = float(val_metrics["mse"])
         log_progress(
-            f"{log_prefix} stage={stage_name} epoch {epoch}/{epochs} val_clean_mse={current_val_mse:.6f} "
-            f"best_val_mse={min(best_val_mse, current_val_mse):.6f} val_clean_mae={current_val_mae:.6f}"
+            f"{log_prefix} stage={stage_name} epoch {epoch}/{epochs} "
+            f"val_clean_mae={current_val_mae:.6f} best_val_mae={min(best_val_mae, current_val_mae):.6f} "
+            f"val_clean_mse={current_val_mse:.6f}"
         )
-        better_mse = current_val_mse + 1e-6 < best_val_mse
-        tie_better_mae = abs(current_val_mse - best_val_mse) <= 1e-6 and current_val_mae + 1e-6 < best_val_mae
-        if better_mse or tie_better_mae:
+        better_mae = current_val_mae + 1e-6 < best_val_mae
+        tie_better_mse = abs(current_val_mae - best_val_mae) <= 1e-6 and current_val_mse + 1e-6 < best_val_mse
+        if better_mae or tie_better_mse:
             best_val_mse = current_val_mse
             best_val_mae = current_val_mae
             best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
@@ -743,7 +758,7 @@ def fit_stage(
         model.load_state_dict(best_state)
     log_progress(
         f"{log_prefix} stage={stage_name} done epochs_ran={epochs_ran} "
-        f"best_val_mse={best_val_mse:.6f} best_val_mae={best_val_mae:.6f}"
+        f"best_val_mae={best_val_mae:.6f} best_val_mse={best_val_mse:.6f}"
     )
     return best_val_mse, best_val_mae, epochs_ran
 
@@ -754,12 +769,20 @@ def build_summary_markdown(
     arg_df: pd.DataFrame,
     wgr_df: pd.DataFrame,
     ri_df: pd.DataFrame,
+    *,
+    summary_title: str = "AIF-Plus Summary",
+    display_name: str = "AIF-Plus",
+    summary_note: str = "",
 ) -> str:
     merged = compare_against_baseline(aif_df, baseline_df)
+    intro = summary_note or (
+        "本轮采用 clean-first 的 AIF-Plus v2：CI-Patch + periodic query + multiscale 主干，"
+        "artifact branch 仅做弱 residual 校正。"
+    )
     lines = [
-        "# AIF-Plus Summary",
+        f"# {summary_title}",
         "",
-        "本轮新增了 `AIF-Plus` 单模型 clean-view 训练脚本，包含 soft masking、双分支 latent split、GRL disentangle、4-expert decoder 和 Stage A/B/C 训练日程。",
+        intro,
         "",
         "## 结果概览",
         "",
@@ -773,7 +796,7 @@ def build_summary_markdown(
         for row in merged.sort_values("delta_mae_vs_baseline").head(8).itertuples(index=False):
             lines.append(
                 f"- {row.dataset_name} / L{int(row.lookback)} / H{row.horizon} / {row.eval_view_name}: "
-                f"AIFPlus={row.mae:.4f}, ERM={row.baseline_mae:.4f}, delta={row.delta_mae_vs_baseline:.4f}"
+                f"{display_name}={row.mae:.4f}, ERM={row.baseline_mae:.4f}, delta={row.delta_mae_vs_baseline:.4f}"
             )
     else:
         lines.append("- 当前没有可与 ERM baseline 对齐的 AIF-Plus 结果。")
@@ -801,6 +824,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(ROOT_DIR / Path(args.config))
     defaults = dict(config.get("defaults", {}))
+    experiment_meta = resolve_experiment_meta(defaults)
     datasets = [canonicalize_dataset_name(str(name)) for name in defaults.get("datasets", [])]
     horizons = [int(item) for item in defaults.get("horizons", [])]
     seeds = [int(item) for item in defaults.get("seeds", [0])]
@@ -912,6 +936,13 @@ def main() -> None:
                         num_experts=int(model_cfg.get("num_experts", 4)),
                         epsilon_nuisance=float(model_cfg.get("epsilon_nuisance", 0.05)),
                         use_diff_branch=bool(model_cfg.get("use_diff_branch", dataset_name in {"solar_AL", "weather"})),
+                        num_queries=int(model_cfg.get("num_queries", 32)),
+                        num_tq_layers=int(model_cfg.get("num_tq_layers", 1)),
+                        query_period=int(model_cfg.get("query_period", 24)),
+                        resid_hidden=int(model_cfg.get("resid_hidden", 64)),
+                        lambda_res_init=float(model_cfg.get("lambda_res_init", 0.01)),
+                        lambda_res_max=float(model_cfg.get("lambda_res_max", 0.05)),
+                        scales=tuple(int(item) for item in model_cfg.get("scales", [1, 2, 4])),
                     )
                 )
                 device = resolve_device(str(runtime_cfg.get("device", "auto")))
@@ -1002,7 +1033,7 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
-                best_val_mse, best_val_mae, stage_b_epochs = fit_stage(
+                stage_b_val_mse, stage_b_val_mae, stage_b_epochs = fit_stage(
                     stage_name="stage_b",
                     model=model,
                     ema=ema,
@@ -1023,7 +1054,8 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
-                best_val_mse, best_val_mae, stage_c_epochs = fit_stage(
+                stage_b_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
+                stage_c_val_mse, stage_c_val_mae, stage_c_epochs = fit_stage(
                     stage_name="stage_c",
                     model=model,
                     ema=ema,
@@ -1044,6 +1076,20 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
+                keep_stage_c = stage_c_val_mae + 1e-6 < stage_b_val_mae or (
+                    abs(stage_c_val_mae - stage_b_val_mae) <= 1e-6 and stage_c_val_mse + 1e-6 < stage_b_val_mse
+                )
+                if keep_stage_c:
+                    best_val_mse, best_val_mae = stage_c_val_mse, stage_c_val_mae
+                else:
+                    if ema is not None:
+                        ema.shadow.load_state_dict(stage_b_state)
+                    model.load_state_dict(stage_b_state)
+                    best_val_mse, best_val_mae = stage_b_val_mse, stage_b_val_mae
+                    log_progress(
+                        f"{log_prefix} retain stage_b checkpoint for clean board "
+                        f"(stage_b_mae={stage_b_val_mae:.6f}, stage_c_mae={stage_c_val_mae:.6f})"
+                    )
 
                 eval_model = ema.shadow if ema is not None else model
                 for eval_view_name, force_intervened_input in [
@@ -1076,10 +1122,10 @@ def main() -> None:
                         split_name="test",
                         setting_meta={
                             "dataset_name": dataset_name,
-                            "backbone": "AIFPlus",
+                            "backbone": experiment_meta["backbone_name"],
                             "lookback": lookback,
                             "horizon": horizon,
-                            "train_view_name": "aif_plus",
+                            "train_view_name": experiment_meta["train_view_name"],
                             "eval_view_name": eval_view_name,
                             "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
                             "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
@@ -1089,10 +1135,10 @@ def main() -> None:
                     result_rows.append(
                         {
                             "dataset_name": dataset_name,
-                            "backbone": "AIFPlus",
+                            "backbone": experiment_meta["backbone_name"],
                             "lookback": lookback,
                             "horizon": horizon,
-                            "train_view_name": "aif_plus",
+                            "train_view_name": experiment_meta["train_view_name"],
                             "eval_view_name": eval_view_name,
                             "seed": seed,
                             "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
@@ -1137,7 +1183,19 @@ def main() -> None:
     ri_df.to_csv(ri_out, index=False)
 
     baseline_df = pd.read_csv(baseline_results_path) if baseline_results_path.exists() else pd.DataFrame()
-    write_markdown(report_out, build_summary_markdown(results_df, baseline_df, arg_df, wgr_df, ri_df))
+    write_markdown(
+        report_out,
+        build_summary_markdown(
+            results_df,
+            baseline_df,
+            arg_df,
+            wgr_df,
+            ri_df,
+            summary_title=experiment_meta["summary_title"],
+            display_name=experiment_meta["display_name"],
+            summary_note=experiment_meta["summary_note"],
+        ),
+    )
     log_progress(f"finished results_out={results_out} rows={len(results_df)}")
 
 

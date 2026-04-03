@@ -1,0 +1,111 @@
+defaults:
+  experiment_name: AIF-Plus-PQT
+  backbone_name: AIFPlusPQT
+  train_view_name: aif_plus_pqt
+  summary_title: AIF-Plus-PQT Summary
+  summary_note: 本轮采用 clean-first 的 AIF-Plus v2，主干为 CI-Patch + periodic query + multiscale mixing，artifact 信息仅通过弱 residual 支路参与预测。
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  use_dataset_presets: true
+  use_preset_lookback: false
+  prefer_config_model_over_presets: true
+  aux_label_mode: with_aux_labels
+  view_alias:
+    ETTh1:
+      clean_like: clean_like
+    ETTh2:
+      clean_like: clean_like
+    ETTm1:
+      clean_like: clean_like
+    ETTm2:
+      clean_like: clean_like
+    solar_AL:
+      clean_like: balanced
+    weather:
+      clean_like: clean_like
+    exchange_rate:
+      clean_like: clean_like
+    electricity:
+      clean_like: natural_clean
+  model:
+    d_model: 256
+    latent_dim: 256
+    expert_hidden: 384
+    head_rank: 32
+    patch_len: 16
+    patch_stride: 8
+    n_blocks: 3
+    n_heads: 8
+    ffn_ratio: 4
+    dropout: 0.1
+    stochastic_depth: 0.05
+    num_queries: 32
+    num_tq_layers: 1
+    scales: [1, 2, 4]
+    resid_hidden: 64
+    lambda_res_init: 0.01
+    lambda_res_max: 0.05
+  runtime:
+    device: auto
+    batch_size: 48
+    eval_batch_size: 96
+    lr: 0.0002
+    weight_decay: 0.05
+    grad_clip: 1.0
+    warmup_ratio: 0.05
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    patience: 8
+    use_ema: true
+    ema_decay: 0.999
+    max_train_windows: 12000
+    max_val_windows: 3000
+    max_test_windows:
+  loss:
+    alpha_pair: 0.05
+    lambda_adv: 0.05
+    lambda_artifact_adv: 0.0125
+    lambda_phase_adv: 0.0125
+    lambda_artifact_aux: 0.0125
+    lambda_phase_aux: 0.0125
+    gamma_rec: 0.1
+    delta_cvar: 0.05
+    lambda_orth: 0.0005
+    cvar_tail_frac: 0.1
+    grl_alpha_final: 1.0
+    grl_warmup_ratio: 0.2
+  stages:
+    stage_a:
+      epochs: 5
+      lr: 0.0002
+      patience: 2
+      use_forecast_loss: true
+      use_reconstruction: true
+      use_pair: false
+      use_adv: false
+      use_cvar: false
+      use_orth: false
+      synthetic_prob: 0.7
+    stage_b:
+      epochs: 30
+      lr: 0.0002
+      patience: 6
+      use_forecast_loss: true
+      use_reconstruction: true
+      use_pair: false
+      use_adv: false
+      use_cvar: false
+      use_orth: false
+    stage_c:
+      epochs: 8
+      lr: 0.00005
+      patience: 3
+      use_forecast_loss: true
+      use_reconstruction: true
+      use_pair: true
+      use_adv: true
+      use_cvar: true
+      use_orth: false

@@ -31,6 +31,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 3,
         "epsilon_nuisance": 0.02,
         "use_diff_branch": False,
+        "query_period": 24,
         "batch_size": 64,
         "learning_rate": 8e-4,
         "weight_decay": 1e-4,
@@ -54,6 +55,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 3,
         "epsilon_nuisance": 0.02,
         "use_diff_branch": False,
+        "query_period": 24,
         "batch_size": 64,
         "learning_rate": 8e-4,
         "weight_decay": 2e-4,
@@ -77,6 +79,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 4,
         "epsilon_nuisance": 0.03,
         "use_diff_branch": True,
+        "query_period": 24,
         "batch_size": 32,
         "learning_rate": 6e-4,
         "weight_decay": 1e-4,
@@ -100,6 +103,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 4,
         "epsilon_nuisance": 0.03,
         "use_diff_branch": True,
+        "query_period": 24,
         "batch_size": 32,
         "learning_rate": 6e-4,
         "weight_decay": 1e-4,
@@ -123,6 +127,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 4,
         "epsilon_nuisance": 0.03,
         "use_diff_branch": True,
+        "query_period": 48,
         "batch_size": 24,
         "learning_rate": 4e-4,
         "weight_decay": 1e-4,
@@ -146,6 +151,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 4,
         "epsilon_nuisance": 0.02,
         "use_diff_branch": True,
+        "query_period": 48,
         "batch_size": 32,
         "learning_rate": 5e-4,
         "weight_decay": 1e-4,
@@ -169,6 +175,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 3,
         "epsilon_nuisance": 0.01,
         "use_diff_branch": False,
+        "query_period": 24,
         "batch_size": 64,
         "learning_rate": 1e-3,
         "weight_decay": 5e-4,
@@ -192,6 +199,7 @@ AIF_PRESETS: dict[str, dict[str, Any]] = {
         "num_experts": 4,
         "epsilon_nuisance": 0.02,
         "use_diff_branch": True,
+        "query_period": 24,
         "batch_size": 16,
         "learning_rate": 3e-4,
         "weight_decay": 1e-4,
@@ -559,6 +567,7 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
 
     use_dataset_presets = bool(defaults.get("use_dataset_presets", False))
     use_preset_lookback = bool(defaults.get("use_preset_lookback", False))
+    prefer_config_model_over_presets = bool(defaults.get("prefer_config_model_over_presets", False))
     aux_label_mode = _resolve_aux_label_mode(defaults)
     lookback = int(defaults.get("lookback", 96))
 
@@ -571,24 +580,29 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
         if preset is not None:
             if use_preset_lookback:
                 lookback = int(preset["seq_len"])
-            model_cfg.update(
-                {
-                    "d_model": preset["d_model"],
-                    "latent_dim": preset["latent_dim"],
-                    "expert_hidden": preset["expert_hidden"],
-                    "head_rank": preset["head_rank"],
-                    "patch_len": preset["patch_len"],
-                    "patch_stride": preset["patch_stride"],
-                    "n_blocks": preset["n_blocks"],
-                    "n_heads": preset["n_heads"],
-                    "ffn_ratio": preset["ffn_ratio"],
-                    "dropout": preset["dropout"],
-                    "stochastic_depth": preset["stochastic_depth"],
-                    "num_experts": preset["num_experts"],
-                    "epsilon_nuisance": preset["epsilon_nuisance"],
-                    "use_diff_branch": preset["use_diff_branch"],
-                }
-            )
+            preset_model_cfg = {
+                "d_model": preset["d_model"],
+                "latent_dim": preset["latent_dim"],
+                "expert_hidden": preset["expert_hidden"],
+                "head_rank": preset["head_rank"],
+                "patch_len": preset["patch_len"],
+                "patch_stride": preset["patch_stride"],
+                "n_blocks": preset["n_blocks"],
+                "n_heads": preset["n_heads"],
+                "ffn_ratio": preset["ffn_ratio"],
+                "dropout": preset["dropout"],
+                "stochastic_depth": preset["stochastic_depth"],
+                "num_experts": preset["num_experts"],
+                "epsilon_nuisance": preset["epsilon_nuisance"],
+                "use_diff_branch": preset["use_diff_branch"],
+                "query_period": preset.get("query_period"),
+            }
+            if prefer_config_model_over_presets:
+                for key, value in preset_model_cfg.items():
+                    if value is not None:
+                        model_cfg.setdefault(key, value)
+            else:
+                model_cfg.update({key: value for key, value in preset_model_cfg.items() if value is not None})
             runtime_cfg.update(
                 {
                     "batch_size": preset["batch_size"],
@@ -602,11 +616,14 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
             source_kind = "dataset_hparam_preset"
             source_url = "src/utils/dataset_hparam_presets.py"
             source_note = _preset_source_note("AIF-Plus", use_preset_lookback)
+            if prefer_config_model_over_presets:
+                source_note += " Explicit model keys in config take priority over preset model values."
 
     runtime_cfg = _apply_common_runtime(runtime_cfg)
     aux_cfg = _copy_dict(COMMON_TRAINING[aux_label_mode]["AIF"])
-    loss_cfg["gamma_rec"] = float(aux_cfg.pop("lambda_reconstruction"))
-    loss_cfg.update(aux_cfg)
+    loss_cfg.setdefault("gamma_rec", float(aux_cfg.pop("lambda_reconstruction")))
+    for key, value in aux_cfg.items():
+        loss_cfg.setdefault(key, value)
     stage_cfg = _scale_aif_stages(base_runtime_cfg=base_runtime_cfg, runtime_cfg=runtime_cfg, base_stage_cfg=stage_cfg)
 
     return {
