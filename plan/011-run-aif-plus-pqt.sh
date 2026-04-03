@@ -167,4 +167,45 @@ write_markdown(
 )
 PY
 
+plan_log "package AIF-Plus-PQT outputs"
+"${PYTHON_BIN}" - \
+  "${ROOT_DIR}" \
+  "${RESULTS_DIR_ABS}" \
+  "${REPORTS_DIR_ABS}" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import zipfile
+
+
+root_dir = Path(sys.argv[1])
+results_dir = Path(sys.argv[2])
+reports_dir = Path(sys.argv[3])
+archive_path = root_dir / "011-aif-plus-pqt-artifacts.zip"
+
+artifact_paths = [
+    results_dir / "aif_plus_pqt_results.csv",
+    results_dir / "aif_plus_pqt_window_errors.csv",
+    results_dir / "aif_plus_pqt_artifact_reliance_gap.csv",
+    results_dir / "aif_plus_pqt_worst_group_risk.csv",
+    results_dir / "aif_plus_pqt_ranking_instability.csv",
+    reports_dir / "aif_plus_pqt_summary.md",
+]
+
+missing = [path for path in artifact_paths if not path.exists()]
+if missing:
+    missing_text = ", ".join(str(path.relative_to(root_dir)) for path in missing)
+    raise FileNotFoundError(f"Missing AIF-Plus-PQT artifacts before packaging: {missing_text}")
+
+if archive_path.exists():
+    archive_path.unlink()
+
+with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    for path in artifact_paths:
+        zf.write(path, arcname=str(path.relative_to(root_dir)))
+
+print(f"archive={archive_path}")
+PY
+
 plan_log "done"
