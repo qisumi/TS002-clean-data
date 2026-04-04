@@ -6,13 +6,13 @@ import importlib.util
 import math
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
@@ -26,7 +26,6 @@ from experiments.aif_shared import (
     compute_aif_arg_table,
     compute_aif_ri_table,
     compute_aif_wgr_table,
-    group_tail_mean,
     load_config,
     resolve_clean_view_name,
 )
@@ -60,6 +59,7 @@ def _load_aifplus_module() -> Any:
 _AIFPLUS_MODULE = _load_aifplus_module()
 AIFPlus = _AIFPLUS_MODULE.AIFPlus
 AIFPlusConfig = _AIFPLUS_MODULE.AIFPlusConfig
+AIFPlusLoss = _AIFPLUS_MODULE.AIFPlusLoss
 
 
 def log_progress(message: str) -> None:
@@ -86,6 +86,15 @@ METADATA_NUMERIC_COLUMNS = [
     "is_flagged",
     "soft_mask_mean",
 ]
+
+
+@dataclass
+class CheckpointSnapshot:
+    epoch: int
+    val_mae: float
+    val_mse: float
+    val_score: float
+    state: dict[str, torch.Tensor]
 
 
 class ModelEMA:
@@ -120,10 +129,60 @@ def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
     return 0.9, 0.999
 
 
-def router_balance_loss(router_weights: torch.Tensor) -> torch.Tensor:
-    importance = router_weights.mean(dim=0)
-    target = torch.full_like(importance, 1.0 / float(max(importance.numel(), 1)))
-    return F.mse_loss(importance, target)
+def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float) -> LambdaLR:
+    warmup_steps = max(1, int(total_steps * max(float(warmup_ratio), 0.0)))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def clone_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in module.state_dict().items()}
+
+
+def average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not states:
+        raise ValueError("average_state_dicts requires at least one state dict")
+    averaged: dict[str, torch.Tensor] = {}
+    for name in states[0]:
+        first = states[0][name]
+        if not torch.is_floating_point(first):
+            averaged[name] = first.clone()
+            continue
+        stacked = torch.stack([state[name].to(dtype=torch.float32) for state in states], dim=0)
+        averaged[name] = stacked.mean(dim=0).to(dtype=first.dtype)
+    return averaged
+
+
+def compute_val_score(metrics: dict[str, float]) -> float:
+    return 0.6 * float(metrics["mae"]) + 0.4 * float(metrics["mse"])
+
+
+def snapshot_sort_key(snapshot: CheckpointSnapshot) -> tuple[float, float, float, int]:
+    return (snapshot.val_score, snapshot.val_mae, snapshot.val_mse, snapshot.epoch)
+
+
+def metrics_improved(
+    *,
+    score: float,
+    mae: float,
+    mse: float,
+    best_score: float,
+    best_mae: float,
+    best_mse: float,
+) -> bool:
+    if score + 1e-9 < best_score:
+        return True
+    if abs(score - best_score) <= 1e-9 and mae + 1e-9 < best_mae:
+        return True
+    if abs(score - best_score) <= 1e-9 and abs(mae - best_mae) <= 1e-9 and mse + 1e-9 < best_mse:
+        return True
+    return False
 
 
 class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
@@ -140,10 +199,7 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
         support_id_lookup: dict[str, int],
         horizon_id: int,
         split_name: str,
-        synthetic_pretrain: bool = False,
         force_intervened_input: bool = False,
-        synthetic_prob: float = 0.0,
-        synthetic_seed: int = 0,
     ) -> None:
         self.rows = rows.sort_values("target_start").reset_index(drop=True).copy().to_dict(orient="records")
         self.dataset_bundle = dataset_bundle
@@ -155,10 +211,7 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
         self.dataset_id = int(dataset_id)
         self.support_id = int(support_id_lookup.get(split_name, 0))
         self.horizon_id = int(horizon_id)
-        self.synthetic_pretrain = bool(synthetic_pretrain)
         self.force_intervened_input = bool(force_intervened_input)
-        self.synthetic_prob = float(synthetic_prob)
-        self.rng = np.random.default_rng(int(synthetic_seed))
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -186,8 +239,7 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
 
         input_end = input_start + x_raw.shape[0] - 1
         for op in parse_intervention_recipe(recipe_text):
-            op_name = str(op.get("op", ""))
-            if op_name == "drop_window":
+            if str(op.get("op", "")) == "drop_window":
                 continue
             span_start = max(int(op.get("start", input_start)), input_start)
             span_end = min(int(op.get("end", input_end)), input_end)
@@ -213,47 +265,8 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
             )
         return x_interp, mask, uncertainty
 
-    def _inject_synthetic_artifact(
-        self,
-        x_clean: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        x_corrupt = x_clean.copy()
-        seq_len, n_vars = x_clean.shape
-        mask = np.zeros_like(x_clean, dtype=np.float32)
-        uncertainty = np.zeros_like(x_clean, dtype=np.float32)
-        span_len = int(self.rng.integers(max(4, seq_len // 12), max(5, seq_len // 4 + 1)))
-        start = int(self.rng.integers(0, max(1, seq_len - span_len + 1)))
-        end = min(seq_len, start + span_len)
-        width = int(self.rng.integers(1, max(2, min(n_vars, max(2, n_vars // 4)) + 1)))
-        dims = self.rng.choice(n_vars, size=width, replace=False)
-        op_name = str(self.rng.choice(["zero_block", "flat_run", "near_constant", "suspicious_repetition"]))
-        if op_name == "zero_block":
-            x_corrupt[start:end, dims] = 0.0
-        elif op_name == "flat_run":
-            source = x_corrupt[start - 1 : start, dims] if start > 0 else x_corrupt[start : start + 1, dims]
-            x_corrupt[start:end, dims] = source
-        elif op_name == "near_constant":
-            base = x_clean[max(0, start - 4) : min(seq_len, end + 4), dims].mean(axis=0, keepdims=True)
-            noise = 0.02 * self.rng.standard_normal(size=(end - start, width)).astype(np.float32)
-            x_corrupt[start:end, dims] = base + noise
-        else:
-            if start >= 4:
-                src_len = min(end - start, start)
-                source = x_clean[start - src_len : start, dims]
-                if len(source) == 0:
-                    source = x_clean[start : start + 1, dims]
-                if len(source) < (end - start):
-                    repeat_factor = int(math.ceil((end - start) / max(len(source), 1)))
-                    source = np.tile(source, (repeat_factor, 1))
-                x_corrupt[start:end, dims] = source[: end - start]
-            else:
-                x_corrupt[start:end, dims] = np.repeat(x_clean[start : start + 1, dims], end - start, axis=0)
-        mask[start:end, dims] = 0.85
-        uncertainty[start:end, dims] = 0.75
-        x_masked = (1.0 - mask) * x_corrupt + mask * x_clean
-        return x_corrupt, x_masked, mask, uncertainty
-
-    def _safe_float(self, value: Any) -> float:
+    @staticmethod
+    def _safe_float(value: Any) -> float:
         if value is None:
             return 0.0
         try:
@@ -264,7 +277,8 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
             return 0.0
         return result
 
-    def _safe_text(self, value: Any, fallback: str = "NA") -> str:
+    @staticmethod
+    def _safe_text(value: Any, fallback: str = "NA") -> str:
         text = str(value).strip()
         if not text or text == "nan":
             return fallback
@@ -277,31 +291,17 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
         target_start = int(row["target_start"])
         target_end = int(row["target_end"])
 
-        x_base = self.dataset_bundle.scaled_values[input_start : input_end + 1].copy()
+        x_raw = self.dataset_bundle.scaled_values[input_start : input_end + 1].copy()
         y = self.dataset_bundle.scaled_values[target_start : target_end + 1].copy()
-        x_cf, rec_mask, uncertainty = self._soft_mask_from_recipe(row=row, x_raw=x_base, input_start=input_start)
-        x_raw = x_base.copy()
+        x_cf, rec_mask, uncertainty = self._soft_mask_from_recipe(row=row, x_raw=x_raw, input_start=input_start)
 
-        if self.synthetic_pretrain and self.synthetic_prob > 0.0 and float(self.rng.random()) <= self.synthetic_prob:
-            x_raw, x_masked, rec_mask, uncertainty = self._inject_synthetic_artifact(x_clean=x_base)
-            x_cf = x_base.copy()
-        elif self.force_intervened_input:
+        if self.force_intervened_input:
             x_raw = x_cf.copy()
             x_masked = x_cf.copy()
-            rec_mask = np.zeros_like(x_base, dtype=np.float32)
-            uncertainty = np.zeros_like(x_base, dtype=np.float32)
+            uncertainty = np.zeros_like(x_raw, dtype=np.float32)
         else:
             x_masked = (1.0 - rec_mask) * x_raw + rec_mask * x_cf
 
-        clean_flag_col = VIEW_FLAG_COLUMNS.get(self.clean_view_name, "is_conservative_clean_view")
-        pair_available = int(
-            int(row.get("is_flagged", 0)) == 1
-            and int(row.get("is_intervened_view", 0)) == 1
-            and (
-                int(row.get(clean_flag_col, 0)) == 1
-                or int(row.get("strict_target_clean", 0)) == 1
-            )
-        )
         artifact_name = self._safe_text(row.get("artifact_group_major", "NA"))
         phase_name = self._safe_text(row.get("dominant_phase_input", row.get("dominant_phase_target", "NA")))
         metadata_num = np.asarray(
@@ -325,10 +325,7 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
         return {
             "x_raw": torch.from_numpy(x_raw.astype(np.float32, copy=False)),
             "x_masked": torch.from_numpy(x_masked.astype(np.float32, copy=False)),
-            "x_cf": torch.from_numpy(x_cf.astype(np.float32, copy=False)),
             "uncertainty": torch.from_numpy(uncertainty.astype(np.float32, copy=False)),
-            "rec_mask": torch.from_numpy(rec_mask.astype(np.float32, copy=False)),
-            "rec_target": torch.from_numpy(x_cf.astype(np.float32, copy=False)),
             "y": torch.from_numpy(y.astype(np.float32, copy=False)),
             "metadata_num": torch.from_numpy(metadata_num),
             "dataset_id": torch.tensor(self.dataset_id, dtype=torch.long),
@@ -337,7 +334,6 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
             "artifact_id": torch.tensor(self.artifact_map.get(artifact_name, 0), dtype=torch.long),
             "phase_id": torch.tensor(self.phase_map.get(phase_name, 0), dtype=torch.long),
             "group_id": torch.tensor(self.group_map.get(self._safe_text(row.get("primary_group_key", "NA")), 0), dtype=torch.long),
-            "pair_available": torch.tensor(float(pair_available), dtype=torch.float32),
             "flagged_mask": torch.tensor(float(row.get("is_flagged", 0)), dtype=torch.float32),
             "window_id": str(row.get("window_id", "")),
             "group_key": self._safe_text(row.get("primary_group_key", "NA")),
@@ -350,7 +346,7 @@ class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run AIF-Plus clean-view training.")
+    parser = argparse.ArgumentParser(description="Run AIF-Plus clean-first training.")
     parser.add_argument("--config", default=str(Path("configs") / "aif_plus.yaml"))
     parser.add_argument("--views-dir", default=str(Path("statistic_results") / "window_views"))
     parser.add_argument("--registry", default=str(Path("statistic_results") / "dataset_registry.csv"))
@@ -363,6 +359,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wgr-out", default=str(Path("results") / "aif_plus_worst_group_risk.csv"))
     parser.add_argument("--ri-out", default=str(Path("results") / "aif_plus_ranking_instability.csv"))
     parser.add_argument("--report-out", default=str(Path("reports") / "aif_plus_summary.md"))
+    parser.add_argument("--checkpoint-comparison-out", default="")
     return parser.parse_args()
 
 
@@ -379,33 +376,6 @@ def resolve_experiment_meta(defaults: dict[str, Any]) -> dict[str, str]:
         "summary_title": summary_title,
         "summary_note": summary_note,
     }
-
-
-def orthogonality_loss(z_clean: torch.Tensor, z_art: torch.Tensor) -> torch.Tensor:
-    if z_clean.shape[0] <= 1:
-        return (z_clean.sum() + z_art.sum()) * 0.0
-    z_clean_centered = z_clean - z_clean.mean(dim=0, keepdim=True)
-    z_art_centered = z_art - z_art.mean(dim=0, keepdim=True)
-    z_clean_norm = F.normalize(z_clean_centered, dim=-1)
-    z_art_norm = F.normalize(z_art_centered, dim=-1)
-    cross = z_clean_norm.transpose(0, 1) @ z_art_norm / float(z_clean.shape[0])
-    return cross.pow(2).mean()
-
-
-def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return (((pred - target) ** 2) * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_ratio: float) -> LambdaLR:
-    warmup_steps = max(1, int(total_steps * max(float(warmup_ratio), 0.0)))
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return float(step + 1) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
-
-    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def evaluate_aif_plus(
@@ -527,7 +497,7 @@ def select_validation_rows(view_df: pd.DataFrame, clean_view_name: str, max_rows
 def load_support_status_lookup(summary_path: Path, dataset_name: str, lookback: int, horizon: int) -> dict[str, str]:
     if not summary_path.exists():
         return {"train": "unknown", "val": "unknown", "test": "unknown"}
-    df = pd.read_csv(summary_path)
+    df = pd.read_csv(summary_path, low_memory=False)
     subset = df.loc[
         (df["dataset_name"] == dataset_name)
         & (df["lookback"] == int(lookback))
@@ -542,13 +512,68 @@ def load_support_status_lookup(summary_path: Path, dataset_name: str, lookback: 
 def load_support_vocab(summary_path: Path) -> dict[str, int]:
     if not summary_path.exists():
         return build_lookup(["unknown"])
-    df = pd.read_csv(summary_path)
+    df = pd.read_csv(summary_path, low_memory=False)
     values = ["unknown"] + df["view_status"].fillna("unknown").astype(str).tolist()
     return build_lookup(values)
 
 
-def fit_stage(
-    stage_name: str,
+def resolve_periods(model_cfg: dict[str, Any]) -> tuple[int, ...]:
+    raw_periods = model_cfg.get("periods")
+    if isinstance(raw_periods, (list, tuple)) and raw_periods:
+        return tuple(max(1, int(item)) for item in raw_periods)
+    query_period = max(1, int(model_cfg.get("query_period", 24)))
+    return (query_period, query_period * 2, query_period * 4)
+
+
+def resolve_queries_per_period(model_cfg: dict[str, Any], periods: tuple[int, ...]) -> int:
+    if "queries_per_period" in model_cfg:
+        return max(1, int(model_cfg["queries_per_period"]))
+    if "num_queries" in model_cfg:
+        total_queries = max(1, int(model_cfg["num_queries"]))
+        return max(1, int(math.ceil(float(total_queries) / float(max(len(periods), 1)))))
+    return 2
+
+
+def build_model_config(
+    *,
+    model_cfg: dict[str, Any],
+    lookback: int,
+    horizon: int,
+    n_vars: int,
+    horizon_vocab_size: int,
+) -> AIFPlusConfig:
+    periods = resolve_periods(model_cfg)
+    patch_len_small = int(model_cfg.get("patch_len_small", model_cfg.get("patch_len", 8)))
+    patch_stride_small = int(model_cfg.get("patch_stride_small", model_cfg.get("patch_stride", 4)))
+    patch_len_large = int(model_cfg.get("patch_len_large", max(patch_len_small * 2, patch_len_small + 4)))
+    patch_stride_large = int(model_cfg.get("patch_stride_large", max(patch_stride_small * 2, patch_stride_small + 2)))
+    return AIFPlusConfig(
+        seq_len=int(lookback),
+        pred_len=int(horizon),
+        enc_in=int(n_vars),
+        horizon_vocab_size=max(int(horizon_vocab_size), 1),
+        d_model=int(model_cfg.get("d_model", 256)),
+        dropout=float(model_cfg.get("dropout", 0.05)),
+        n_heads=int(model_cfg.get("n_heads", 8)),
+        n_patch_layers=int(model_cfg.get("n_patch_layers", model_cfg.get("n_blocks", 2))),
+        n_decoder_layers=int(model_cfg.get("n_decoder_layers", 2)),
+        ffn_ratio=int(model_cfg.get("ffn_ratio", 4)),
+        use_diff_branch=bool(model_cfg.get("use_diff_branch", n_vars > 8)),
+        patch_len_small=patch_len_small,
+        patch_stride_small=patch_stride_small,
+        patch_len_large=patch_len_large,
+        patch_stride_large=patch_stride_large,
+        patch_jitter=bool(model_cfg.get("patch_jitter", True)),
+        periods=periods,
+        queries_per_period=resolve_queries_per_period(model_cfg, periods),
+        spectral_topk=int(model_cfg.get("spectral_topk", 8)),
+        residual_hidden=int(model_cfg.get("residual_hidden", model_cfg.get("resid_hidden", 32))),
+        lambda_res_max=float(model_cfg.get("lambda_res_max", model_cfg.get("lambda_res_init", 0.03))),
+    )
+
+
+def fit_aif_v4(
+    *,
     model: AIFPlus,
     ema: ModelEMA | None,
     train_loader: DataLoader[Any],
@@ -557,7 +582,6 @@ def fit_stage(
     events_lookup: dict[str, dict[str, Any]],
     clean_view_name: str,
     runtime_cfg: dict[str, Any],
-    stage_cfg: dict[str, Any],
     loss_cfg: dict[str, Any],
     metadata_context: dict[str, Any],
     group_map: dict[str, int],
@@ -567,17 +591,17 @@ def fit_stage(
     horizon_id: int,
     seed: int,
     log_prefix: str,
-) -> tuple[float, float, int]:
-    epochs = int(stage_cfg.get("epochs", 0))
+) -> dict[str, Any]:
+    epochs = int(runtime_cfg.get("epochs", 35))
     if epochs <= 0 or len(train_loader.dataset) == 0:
-        return float("inf"), float("inf"), 0
+        raise ValueError("AIF-Plus v4 training requires positive epochs and non-empty train dataset")
 
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
     scaler = build_grad_scaler(device, enabled=amp_enabled)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(stage_cfg.get("lr", runtime_cfg.get("lr", 2e-4))),
+        lr=float(runtime_cfg.get("lr", 2e-4)),
         weight_decay=float(runtime_cfg.get("weight_decay", 0.05)),
         betas=parse_optimizer_betas(runtime_cfg),
     )
@@ -587,63 +611,43 @@ def fit_stage(
         total_steps=total_steps,
         warmup_ratio=float(runtime_cfg.get("warmup_ratio", 0.05)),
     )
+    loss_fn = AIFPlusLoss(
+        mae_weight=float(loss_cfg.get("mae_weight", 0.7)),
+        mse_weight=float(loss_cfg.get("mse_weight", 0.3)),
+    )
     grad_clip = float(runtime_cfg.get("grad_clip", 1.0))
-    patience = int(stage_cfg.get("patience", runtime_cfg.get("patience", 8)))
+    patience = int(runtime_cfg.get("patience", 8))
+    checkpoint_topk = max(1, int(runtime_cfg.get("checkpoint_topk", 5)))
+    checkpoint_soup_k = max(1, int(runtime_cfg.get("checkpoint_soup_k", 3)))
 
-    best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
-    best_val_mae = float("inf")
-    best_val_mse = float("inf")
+    best_score = float("inf")
+    best_mae = float("inf")
+    best_mse = float("inf")
     epochs_ran = 0
     patience_counter = 0
+    top_checkpoints: list[CheckpointSnapshot] = []
     set_random_seed(seed)
     log_progress(
-        f"{log_prefix} stage={stage_name} start epochs={epochs} lr={float(stage_cfg.get('lr', runtime_cfg.get('lr', 2e-4))):.2e} "
-        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)}"
+        f"{log_prefix} fit start epochs={epochs} lr={float(runtime_cfg.get('lr', 2e-4)):.2e} "
+        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)} topk={checkpoint_topk} soup_k={checkpoint_soup_k}"
     )
-
-    lambda_pair = float(loss_cfg.get("alpha_pair", 0.2))
-    lambda_rec = float(loss_cfg.get("gamma_rec", 0.2))
-    lambda_cvar = float(loss_cfg.get("delta_cvar", 0.15))
-    lambda_orth = float(loss_cfg.get("lambda_orth", 1e-3))
-    lambda_artifact_adv = float(loss_cfg.get("lambda_artifact_adv", loss_cfg.get("lambda_adv", 0.05)))
-    lambda_phase_adv = float(loss_cfg.get("lambda_phase_adv", loss_cfg.get("lambda_adv", 0.05)))
-    lambda_artifact_aux = float(loss_cfg.get("lambda_artifact_aux", loss_cfg.get("lambda_adv", 0.05)))
-    lambda_phase_aux = float(loss_cfg.get("lambda_phase_aux", loss_cfg.get("lambda_adv", 0.05)))
-    grl_alpha_final = float(loss_cfg.get("grl_alpha_final", 1.0))
-    grl_warmup_ratio = float(loss_cfg.get("grl_warmup_ratio", 0.0))
-    tail_frac = float(loss_cfg.get("cvar_tail_frac", 0.2))
-    global_step = 0
-    warmup_steps = max(1, int(total_steps * max(grl_warmup_ratio, 0.0)))
 
     for epoch in range(1, epochs + 1):
         model.train()
-        for batch in train_loader:
-            global_step += 1
-            if bool(stage_cfg.get("use_adv", False)):
-                if grl_alpha_final <= 0.0:
-                    model.grl.alpha = 0.0
-                elif grl_warmup_ratio > 0.0:
-                    model.grl.alpha = grl_alpha_final * min(1.0, float(global_step) / float(warmup_steps))
-                else:
-                    model.grl.alpha = grl_alpha_final
-            else:
-                model.grl.alpha = 0.0
+        train_loss_sum = 0.0
+        train_mae_sum = 0.0
+        train_mse_sum = 0.0
+        train_batches = 0
 
+        for batch in train_loader:
             x_raw = batch["x_raw"].to(device, non_blocking=True)
             x_masked = batch["x_masked"].to(device, non_blocking=True)
-            x_cf = batch["x_cf"].to(device, non_blocking=True)
             uncertainty = batch["uncertainty"].to(device, non_blocking=True)
-            rec_mask = batch["rec_mask"].to(device, non_blocking=True)
-            rec_target = batch["rec_target"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
             metadata_num = batch["metadata_num"].to(device, non_blocking=True)
             dataset_id = batch["dataset_id"].to(device, non_blocking=True)
             support_id = batch["support_id"].to(device, non_blocking=True)
             horizon_tensor = batch["horizon_id"].to(device, non_blocking=True)
-            artifact_id = batch["artifact_id"].to(device, non_blocking=True)
-            phase_id = batch["phase_id"].to(device, non_blocking=True)
-            group_id = batch["group_id"].to(device, non_blocking=True)
-            pair_available = batch["pair_available"].to(device, non_blocking=True) > 0.5
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -656,52 +660,8 @@ def fit_stage(
                     support_id=support_id,
                     horizon_id=horizon_tensor,
                 )
-                pred = outputs["pred"]
-                per_sample_mse = F.mse_loss(pred, y, reduction="none").mean(dim=(1, 2))
-                loss = per_sample_mse.mean() if bool(stage_cfg.get("use_forecast_loss", True)) else pred.new_tensor(0.0)
-
-                rec_loss = masked_mse_loss(outputs["reconstruction"], rec_target, rec_mask)
-                if bool(stage_cfg.get("use_reconstruction", True)):
-                    loss = loss + lambda_rec * rec_loss
-
-                balance_loss = pred.new_tensor(0.0)
-                if "router_weights" in outputs and float(loss_cfg.get("lambda_router_balance", 0.0)) > 0.0:
-                    balance_loss = router_balance_loss(outputs["router_weights"])
-                    loss = loss + float(loss_cfg.get("lambda_router_balance", 0.0)) * balance_loss
-
-                pair_loss = pred.new_tensor(0.0)
-                if bool(stage_cfg.get("use_pair", False)) and bool(pair_available.any()):
-                    cf_outputs = model(
-                        x_raw=x_cf,
-                        x_masked=x_cf,
-                        uncertainty=torch.zeros_like(uncertainty),
-                        metadata_num=metadata_num,
-                        dataset_id=dataset_id,
-                        support_id=support_id,
-                        horizon_id=horizon_tensor,
-                    )
-                    pair_loss = ((pred[pair_available] - cf_outputs["pred"][pair_available]) ** 2).mean()
-                    loss = loss + lambda_pair * pair_loss
-
-                adv_loss = pred.new_tensor(0.0)
-                if bool(stage_cfg.get("use_adv", False)):
-                    adv_loss = (
-                        lambda_artifact_adv * F.cross_entropy(outputs["artifact_logits_clean"], artifact_id)
-                        + lambda_phase_adv * F.cross_entropy(outputs["phase_logits_clean"], phase_id)
-                        + lambda_artifact_aux * F.cross_entropy(outputs["artifact_logits_art"], artifact_id)
-                        + lambda_phase_aux * F.cross_entropy(outputs["phase_logits_art"], phase_id)
-                    )
-                    loss = loss + adv_loss
-
-                cvar_loss = pred.new_tensor(0.0)
-                if bool(stage_cfg.get("use_cvar", False)):
-                    cvar_loss = group_tail_mean(per_sample_mse, group_id, tail_frac=tail_frac, round_up=True)
-                    loss = loss + lambda_cvar * cvar_loss
-
-                orth_loss = pred.new_tensor(0.0)
-                if bool(stage_cfg.get("use_orth", False)):
-                    orth_loss = orthogonality_loss(outputs["z_clean"], outputs["z_art"])
-                    loss = loss + lambda_orth * orth_loss
+                loss_terms = loss_fn(outputs["pred"], y)
+                loss = loss_terms["loss"]
 
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -712,6 +672,11 @@ def fit_stage(
             scheduler.step()
             if ema is not None:
                 ema.update(model)
+
+            train_loss_sum += float(loss.detach().cpu().item())
+            train_mae_sum += float(loss_terms["mae"].detach().cpu().item())
+            train_mse_sum += float(loss_terms["mse"].detach().cpu().item())
+            train_batches += 1
 
         eval_model = ema.shadow if ema is not None else model
         val_metrics, _ = evaluate_aif_plus(
@@ -731,36 +696,158 @@ def fit_stage(
             split_name="val",
             setting_meta={},
         )
-        epochs_ran = epoch
         current_val_mae = float(val_metrics["mae"])
         current_val_mse = float(val_metrics["mse"])
+        current_val_score = compute_val_score(val_metrics)
+        epochs_ran = epoch
+
         log_progress(
-            f"{log_prefix} stage={stage_name} epoch {epoch}/{epochs} "
-            f"val_clean_mae={current_val_mae:.6f} best_val_mae={min(best_val_mae, current_val_mae):.6f} "
-            f"val_clean_mse={current_val_mse:.6f}"
+            f"{log_prefix} epoch {epoch}/{epochs} train_loss={train_loss_sum / max(train_batches, 1):.6f} "
+            f"train_mae={train_mae_sum / max(train_batches, 1):.6f} train_mse={train_mse_sum / max(train_batches, 1):.6f} "
+            f"val_mae={current_val_mae:.6f} val_mse={current_val_mse:.6f} val_score={current_val_score:.6f} "
+            f"best_score={min(best_score, current_val_score):.6f}"
         )
-        better_mae = current_val_mae + 1e-6 < best_val_mae
-        tie_better_mse = abs(current_val_mae - best_val_mae) <= 1e-6 and current_val_mse + 1e-6 < best_val_mse
-        if better_mae or tie_better_mse:
-            best_val_mse = current_val_mse
-            best_val_mae = current_val_mae
-            best_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
+
+        if not math.isfinite(current_val_score):
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+            continue
+
+        worst_snapshot = top_checkpoints[-1] if top_checkpoints else None
+        should_store = len(top_checkpoints) < checkpoint_topk
+        if not should_store and worst_snapshot is not None:
+            should_store = snapshot_sort_key(
+                CheckpointSnapshot(
+                    epoch=epoch,
+                    val_mae=current_val_mae,
+                    val_mse=current_val_mse,
+                    val_score=current_val_score,
+                    state={},
+                )
+            ) < snapshot_sort_key(worst_snapshot)
+        if should_store:
+            top_checkpoints.append(
+                CheckpointSnapshot(
+                    epoch=epoch,
+                    val_mae=current_val_mae,
+                    val_mse=current_val_mse,
+                    val_score=current_val_score,
+                    state=clone_state_dict(eval_model),
+                )
+            )
+            top_checkpoints.sort(key=snapshot_sort_key)
+            del top_checkpoints[checkpoint_topk:]
+
+        if metrics_improved(
+            score=current_val_score,
+            mae=current_val_mae,
+            mse=current_val_mse,
+            best_score=best_score,
+            best_mae=best_mae,
+            best_mse=best_mse,
+        ):
+            best_score = current_val_score
+            best_mae = current_val_mae
+            best_mse = current_val_mse
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 break
 
+    if not top_checkpoints:
+        final_model = ema.shadow if ema is not None else model
+        val_metrics, _ = evaluate_aif_plus(
+            model=final_model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=val_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=False,
+            split_name="val",
+            setting_meta={},
+        )
+        top_checkpoints.append(
+            CheckpointSnapshot(
+                epoch=max(epochs_ran, 1),
+                val_mae=float(val_metrics["mae"]),
+                val_mse=float(val_metrics["mse"]),
+                val_score=compute_val_score(val_metrics),
+                state=clone_state_dict(final_model),
+            )
+        )
+
+    top_checkpoints.sort(key=snapshot_sort_key)
+    best_single = top_checkpoints[0]
+    soup_sources = top_checkpoints[: min(checkpoint_soup_k, len(top_checkpoints))]
+    ema_state = clone_state_dict(ema.shadow if ema is not None else model)
+    variants: dict[str, dict[str, Any]] = {
+        "best_single": {
+            "state": best_single.state,
+            "source_epochs": [int(best_single.epoch)],
+        },
+        "ema": {
+            "state": ema_state,
+            "source_epochs": [int(max(epochs_ran, 1))],
+        },
+        "soup": {
+            "state": average_state_dicts([snapshot.state for snapshot in soup_sources]),
+            "source_epochs": [int(snapshot.epoch) for snapshot in soup_sources],
+        },
+    }
+
+    for variant_name, payload in variants.items():
+        model.load_state_dict(payload["state"])
+        variant_metrics, _ = evaluate_aif_plus(
+            model=model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=val_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=False,
+            split_name="val",
+            setting_meta={},
+        )
+        payload["val_metrics"] = variant_metrics
+        payload["val_score"] = compute_val_score(variant_metrics)
+        log_progress(
+            f"{log_prefix} checkpoint_variant={variant_name} "
+            f"val_mae={float(variant_metrics['mae']):.6f} val_mse={float(variant_metrics['mse']):.6f} "
+            f"val_score={payload['val_score']:.6f} source_epochs={','.join(str(item) for item in payload['source_epochs'])}"
+        )
+
+    model.load_state_dict(variants["soup"]["state"])
     if ema is not None:
-        ema.shadow.load_state_dict(best_state)
-        model.load_state_dict(best_state)
-    else:
-        model.load_state_dict(best_state)
-    log_progress(
-        f"{log_prefix} stage={stage_name} done epochs_ran={epochs_ran} "
-        f"best_val_mae={best_val_mae:.6f} best_val_mse={best_val_mse:.6f}"
-    )
-    return best_val_mse, best_val_mae, epochs_ran
+        ema.load_state_dict(variants["soup"]["state"])
+
+    return {
+        "epochs_ran": int(epochs_ran),
+        "variants": variants,
+        "top_checkpoints": [
+            {
+                "epoch": int(snapshot.epoch),
+                "val_mae": float(snapshot.val_mae),
+                "val_mse": float(snapshot.val_mse),
+                "val_score": float(snapshot.val_score),
+            }
+            for snapshot in top_checkpoints
+        ],
+    }
 
 
 def build_summary_markdown(
@@ -770,14 +857,15 @@ def build_summary_markdown(
     wgr_df: pd.DataFrame,
     ri_df: pd.DataFrame,
     *,
+    checkpoint_df: pd.DataFrame | None = None,
     summary_title: str = "AIF-Plus Summary",
     display_name: str = "AIF-Plus",
     summary_note: str = "",
 ) -> str:
     merged = compare_against_baseline(aif_df, baseline_df)
     intro = summary_note or (
-        "本轮采用 clean-first 的 AIF-Plus v2：CI-Patch + periodic query + multiscale 主干，"
-        "artifact branch 仅做弱 residual 校正。"
+        "本轮采用 clean-first 的 AIF-Plus：clean trunk 仅看 x_masked，训练目标为 0.7*MAE + 0.3*MSE，"
+        "验证使用 EMA，最终测试使用 checkpoint soup。"
     )
     lines = [
         f"# {summary_title}",
@@ -800,6 +888,28 @@ def build_summary_markdown(
             )
     else:
         lines.append("- 当前没有可与 ERM baseline 对齐的 AIF-Plus 结果。")
+
+    if checkpoint_df is not None and not checkpoint_df.empty:
+        lines.extend(["", "## Checkpoint Comparison", ""])
+        raw_cmp = checkpoint_df[checkpoint_df["eval_view_name"] == "raw"].copy()
+        if raw_cmp.empty:
+            raw_cmp = checkpoint_df.copy()
+        summary = (
+            raw_cmp.groupby("checkpoint_variant", dropna=False)
+            .agg(
+                mean_val_score=("val_score", "mean"),
+                mean_test_mae=("mae", "mean"),
+                n_rows=("mae", "size"),
+            )
+            .reset_index()
+            .sort_values(["mean_test_mae", "mean_val_score"])
+        )
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.checkpoint_variant}: mean_val_score={row.mean_val_score:.4f}, "
+                f"mean_test_mae={row.mean_test_mae:.4f}, rows={int(row.n_rows)}"
+            )
+
     lines.extend(["", "## Robustness Outputs", ""])
     if not arg_df.empty:
         for row in arg_df.sort_values("ARG_mae", ascending=False).head(6).itertuples(index=False):
@@ -818,6 +928,39 @@ def build_summary_markdown(
             )
     lines.append("")
     return "\n".join(lines)
+
+
+def sort_results_frame(results_df: pd.DataFrame) -> pd.DataFrame:
+    if results_df.empty:
+        return results_df
+    sort_columns = [
+        "dataset_name",
+        "backbone",
+        "lookback",
+        "horizon",
+        "train_view_name",
+        "eval_view_name",
+        "seed",
+    ]
+    existing = [column for column in sort_columns if column in results_df.columns]
+    return results_df.sort_values(existing).reset_index(drop=True)
+
+
+def sort_window_errors_frame(window_errors_df: pd.DataFrame) -> pd.DataFrame:
+    if window_errors_df.empty:
+        return window_errors_df
+    sort_columns = [
+        "dataset_name",
+        "backbone",
+        "lookback",
+        "horizon",
+        "train_view_name",
+        "eval_view_name",
+        "checkpoint_variant",
+        "window_id",
+    ]
+    existing = [column for column in sort_columns if column in window_errors_df.columns]
+    return window_errors_df.sort_values(existing).reset_index(drop=True)
 
 
 def main() -> None:
@@ -839,6 +982,7 @@ def main() -> None:
 
     result_rows: list[dict[str, Any]] = []
     error_frames: list[pd.DataFrame] = []
+    checkpoint_rows: list[dict[str, Any]] = []
     bundle_cache: dict[str, Any] = {}
     events_cache: dict[str, dict[str, Any]] = {}
     log_progress(f"start datasets={datasets} horizons={horizons}")
@@ -848,25 +992,19 @@ def main() -> None:
         runtime_cfg = dict(dataset_cfg["runtime"])
         model_cfg = dict(dataset_cfg["model"])
         loss_cfg = dict(dataset_cfg["loss"])
-        stage_cfg = dict(dataset_cfg["stages"])
         lookback = int(dataset_cfg["lookback"])
         collapse_aux_label_vocabs = bool(dataset_cfg["collapse_aux_label_vocabs"])
         bundle_cache[dataset_name] = load_dataset_bundle(dataset_name, registry_path=registry_path)
         events_cache[dataset_name] = load_events_lookup(events_path=events_path, dataset_name=dataset_name)
         clean_view_name = resolve_clean_view_name(config, dataset_name)
+
         for horizon in horizons:
             log_progress(f"prepare dataset={dataset_name} L{lookback} H{horizon}")
             view_df = load_view_frame(views_dir, dataset_name, lookback=lookback, horizon=horizon)
-            train_clean_rows = select_view_rows(
+            train_rows = select_view_rows(
                 view_df,
                 split_name="train",
                 view_name=clean_view_name,
-                max_rows=runtime_cfg.get("max_train_windows"),
-            )
-            train_raw_rows = select_view_rows(
-                view_df,
-                split_name="train",
-                view_name="raw",
                 max_rows=runtime_cfg.get("max_train_windows"),
             )
             val_rows = select_validation_rows(
@@ -874,7 +1012,7 @@ def main() -> None:
                 clean_view_name=clean_view_name,
                 max_rows=runtime_cfg.get("max_val_windows"),
             )
-            if train_clean_rows.empty or train_raw_rows.empty or val_rows.empty:
+            if train_rows.empty or val_rows.empty:
                 log_progress(f"skip dataset={dataset_name} L{lookback} H{horizon} due to empty train/val rows")
                 continue
 
@@ -900,7 +1038,7 @@ def main() -> None:
                     .tolist()
                 )
             )
-            group_map = build_group_map(train_raw_rows)
+            group_map = build_group_map(train_rows)
             metadata_context = {
                 "dataset_id": dataset_id_map[dataset_name],
                 "horizon_id": horizon_id_map[horizon],
@@ -911,89 +1049,22 @@ def main() -> None:
 
             for seed in seeds:
                 set_random_seed(seed)
+                device = resolve_device(str(runtime_cfg.get("device", "auto")))
                 model = AIFPlus(
-                    AIFPlusConfig(
-                        seq_len=lookback,
-                        pred_len=horizon,
-                        enc_in=bundle_cache[dataset_name].n_vars,
-                        metadata_num_dim=len(METADATA_NUMERIC_COLUMNS),
-                        artifact_vocab_size=len(artifact_map),
-                        phase_vocab_size=len(phase_map),
-                        dataset_vocab_size=max(len(dataset_id_map), 1),
-                        support_vocab_size=max(len(support_vocab), 1),
-                        horizon_vocab_size=max(len(horizon_id_map), 1),
-                        d_model=int(model_cfg.get("d_model", 256)),
-                        latent_dim=int(model_cfg.get("latent_dim", 256)),
-                        expert_hidden=int(model_cfg.get("expert_hidden", 384)),
-                        head_rank=int(model_cfg.get("head_rank", 32)),
-                        patch_len=int(model_cfg.get("patch_len", 8)),
-                        patch_stride=int(model_cfg.get("patch_stride", 4)),
-                        n_blocks=int(model_cfg.get("n_blocks", 4)),
-                        n_heads=int(model_cfg.get("n_heads", 8)),
-                        ffn_ratio=int(model_cfg.get("ffn_ratio", 4)),
-                        dropout=float(model_cfg.get("dropout", 0.1)),
-                        stochastic_depth=float(model_cfg.get("stochastic_depth", 0.1)),
-                        num_experts=int(model_cfg.get("num_experts", 4)),
-                        epsilon_nuisance=float(model_cfg.get("epsilon_nuisance", 0.05)),
-                        use_diff_branch=bool(model_cfg.get("use_diff_branch", dataset_name in {"solar_AL", "weather"})),
-                        num_queries=int(model_cfg.get("num_queries", 32)),
-                        num_tq_layers=int(model_cfg.get("num_tq_layers", 1)),
-                        query_period=int(model_cfg.get("query_period", 24)),
-                        resid_hidden=int(model_cfg.get("resid_hidden", 64)),
-                        lambda_res_init=float(model_cfg.get("lambda_res_init", 0.01)),
-                        lambda_res_max=float(model_cfg.get("lambda_res_max", 0.05)),
-                        scales=tuple(int(item) for item in model_cfg.get("scales", [1, 2, 4])),
+                    build_model_config(
+                        model_cfg=model_cfg,
+                        lookback=lookback,
+                        horizon=horizon,
+                        n_vars=bundle_cache[dataset_name].n_vars,
+                        horizon_vocab_size=len(horizon_id_map),
                     )
                 )
-                device = resolve_device(str(runtime_cfg.get("device", "auto")))
                 model.to(device)
                 ema = ModelEMA(model, decay=float(runtime_cfg.get("ema_decay", 0.999))) if bool(runtime_cfg.get("use_ema", True)) else None
                 pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
-
-                stage_a_loader = build_loader(
+                train_loader = build_loader(
                     AIFPlusWindowDataset(
-                        rows=train_raw_rows,
-                        dataset_bundle=bundle_cache[dataset_name],
-                        events_lookup=events_cache[dataset_name],
-                        clean_view_name=clean_view_name,
-                        group_map=group_map,
-                        artifact_map=artifact_map,
-                        phase_map=phase_map,
-                        dataset_id=dataset_id_map[dataset_name],
-                        support_id_lookup=support_id_lookup,
-                        horizon_id=horizon_id_map[horizon],
-                        split_name="train",
-                        synthetic_pretrain=True,
-                        synthetic_prob=float(stage_cfg.get("stage_a", {}).get("synthetic_prob", 0.7)),
-                        synthetic_seed=seed + horizon,
-                    ),
-                    batch_size=int(runtime_cfg.get("batch_size", 64)),
-                    shuffle=True,
-                    num_workers=int(runtime_cfg.get("num_workers", 0)),
-                    pin_memory=pin_memory,
-                )
-                stage_b_loader = build_loader(
-                    AIFPlusWindowDataset(
-                        rows=train_clean_rows,
-                        dataset_bundle=bundle_cache[dataset_name],
-                        events_lookup=events_cache[dataset_name],
-                        clean_view_name=clean_view_name,
-                        group_map=group_map,
-                        artifact_map=artifact_map,
-                        phase_map=phase_map,
-                        dataset_id=dataset_id_map[dataset_name],
-                        support_id_lookup=support_id_lookup,
-                        horizon_id=horizon_id_map[horizon],
-                        split_name="train",
-                    ),
-                    batch_size=int(runtime_cfg.get("batch_size", 64)),
-                    shuffle=True,
-                    num_workers=int(runtime_cfg.get("num_workers", 0)),
-                    pin_memory=pin_memory,
-                )
-                stage_c_loader = build_loader(
-                    AIFPlusWindowDataset(
-                        rows=train_raw_rows,
+                        rows=train_rows,
                         dataset_bundle=bundle_cache[dataset_name],
                         events_lookup=events_cache[dataset_name],
                         clean_view_name=clean_view_name,
@@ -1012,17 +1083,15 @@ def main() -> None:
                 )
 
                 log_prefix = f"{dataset_name}/L{lookback}/H{horizon}/seed{seed}"
-                _, _, stage_a_epochs = fit_stage(
-                    stage_name="stage_a",
+                train_info = fit_aif_v4(
                     model=model,
                     ema=ema,
-                    train_loader=stage_a_loader,
+                    train_loader=train_loader,
                     val_rows=val_rows,
                     dataset_bundle=bundle_cache[dataset_name],
                     events_lookup=events_cache[dataset_name],
                     clean_view_name=clean_view_name,
                     runtime_cfg=runtime_cfg,
-                    stage_cfg=dict(stage_cfg.get("stage_a", {})),
                     loss_cfg=loss_cfg,
                     metadata_context=metadata_context,
                     group_map=group_map,
@@ -1033,137 +1102,112 @@ def main() -> None:
                     seed=seed,
                     log_prefix=log_prefix,
                 )
-                stage_b_val_mse, stage_b_val_mae, stage_b_epochs = fit_stage(
-                    stage_name="stage_b",
-                    model=model,
-                    ema=ema,
-                    train_loader=stage_b_loader,
-                    val_rows=val_rows,
-                    dataset_bundle=bundle_cache[dataset_name],
-                    events_lookup=events_cache[dataset_name],
-                    clean_view_name=clean_view_name,
-                    runtime_cfg=runtime_cfg,
-                    stage_cfg=dict(stage_cfg.get("stage_b", {})),
-                    loss_cfg=loss_cfg,
-                    metadata_context=metadata_context,
-                    group_map=group_map,
-                    artifact_map=artifact_map,
-                    phase_map=phase_map,
-                    support_id_lookup=support_id_lookup,
-                    horizon_id=horizon_id_map[horizon],
-                    seed=seed,
-                    log_prefix=log_prefix,
-                )
-                stage_b_state = copy.deepcopy((ema.shadow if ema is not None else model).state_dict())
-                stage_c_val_mse, stage_c_val_mae, stage_c_epochs = fit_stage(
-                    stage_name="stage_c",
-                    model=model,
-                    ema=ema,
-                    train_loader=stage_c_loader,
-                    val_rows=val_rows,
-                    dataset_bundle=bundle_cache[dataset_name],
-                    events_lookup=events_cache[dataset_name],
-                    clean_view_name=clean_view_name,
-                    runtime_cfg=runtime_cfg,
-                    stage_cfg=dict(stage_cfg.get("stage_c", {})),
-                    loss_cfg=loss_cfg,
-                    metadata_context=metadata_context,
-                    group_map=group_map,
-                    artifact_map=artifact_map,
-                    phase_map=phase_map,
-                    support_id_lookup=support_id_lookup,
-                    horizon_id=horizon_id_map[horizon],
-                    seed=seed,
-                    log_prefix=log_prefix,
-                )
-                keep_stage_c = stage_c_val_mae + 1e-6 < stage_b_val_mae or (
-                    abs(stage_c_val_mae - stage_b_val_mae) <= 1e-6 and stage_c_val_mse + 1e-6 < stage_b_val_mse
-                )
-                if keep_stage_c:
-                    best_val_mse, best_val_mae = stage_c_val_mse, stage_c_val_mae
-                else:
-                    if ema is not None:
-                        ema.shadow.load_state_dict(stage_b_state)
-                    model.load_state_dict(stage_b_state)
-                    best_val_mse, best_val_mae = stage_b_val_mse, stage_b_val_mae
-                    log_progress(
-                        f"{log_prefix} retain stage_b checkpoint for clean board "
-                        f"(stage_b_mae={stage_b_val_mae:.6f}, stage_c_mae={stage_c_val_mae:.6f})"
-                    )
 
-                eval_model = ema.shadow if ema is not None else model
-                for eval_view_name, force_intervened_input in [
-                    ("raw", False),
-                    (clean_view_name, False),
-                    ("intervened", True),
-                ]:
-                    eval_rows = select_view_rows(
-                        view_df,
-                        split_name="test",
-                        view_name=eval_view_name,
-                        max_rows=runtime_cfg.get("max_test_windows"),
-                    )
-                    if eval_rows.empty:
-                        continue
-                    metrics, errors = evaluate_aif_plus(
-                        model=eval_model,
-                        dataset_bundle=bundle_cache[dataset_name],
-                        events_lookup=events_cache[dataset_name],
-                        eval_rows=eval_rows,
-                        clean_view_name=clean_view_name,
-                        runtime_cfg=runtime_cfg,
-                        metadata_context=metadata_context,
-                        group_map=group_map,
-                        artifact_map=artifact_map,
-                        phase_map=phase_map,
-                        support_id_lookup=support_id_lookup,
-                        horizon_id=horizon_id_map[horizon],
-                        force_intervened_input=force_intervened_input,
-                        split_name="test",
-                        setting_meta={
-                            "dataset_name": dataset_name,
-                            "backbone": experiment_meta["backbone_name"],
-                            "lookback": lookback,
-                            "horizon": horizon,
-                            "train_view_name": experiment_meta["train_view_name"],
-                            "eval_view_name": eval_view_name,
-                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                        },
-                    )
-                    result_rows.append(
-                        {
-                            "dataset_name": dataset_name,
-                            "backbone": experiment_meta["backbone_name"],
-                            "lookback": lookback,
-                            "horizon": horizon,
-                            "train_view_name": experiment_meta["train_view_name"],
-                            "eval_view_name": eval_view_name,
-                            "seed": seed,
-                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                            "n_train_windows": int(len(train_clean_rows)),
-                            "n_eval_windows": int(len(eval_rows)),
-                            "best_val_mae": round(float(best_val_mae), 6),
-                            "best_val_mse": round(float(best_val_mse), 6),
-                            "stage_a_epochs_ran": int(stage_a_epochs),
-                            "stage_b_epochs_ran": int(stage_b_epochs),
-                            "stage_c_epochs_ran": int(stage_c_epochs),
-                            "mae": round(float(metrics["mae"]), 6),
-                            "mse": round(float(metrics["mse"]), 6),
-                            "smape": round(float(metrics["smape"]), 6),
-                        }
-                    )
-                    error_frames.append(errors)
-                    log_progress(
-                        f"done dataset={dataset_name} L{lookback} H{horizon} seed={seed} "
-                        f"view={eval_view_name} mae={float(metrics['mae']):.6f}"
-                    )
+                for variant_name, variant_payload in train_info["variants"].items():
+                    model.load_state_dict(variant_payload["state"])
+                    source_epochs_text = ",".join(str(item) for item in variant_payload["source_epochs"])
+                    for eval_view_name, force_intervened_input in [
+                        ("raw", False),
+                        (clean_view_name, False),
+                        ("intervened", True),
+                    ]:
+                        eval_rows = select_view_rows(
+                            view_df,
+                            split_name="test",
+                            view_name=eval_view_name,
+                            max_rows=runtime_cfg.get("max_test_windows"),
+                        )
+                        if eval_rows.empty:
+                            continue
+                        metrics, errors = evaluate_aif_plus(
+                            model=model,
+                            dataset_bundle=bundle_cache[dataset_name],
+                            events_lookup=events_cache[dataset_name],
+                            eval_rows=eval_rows,
+                            clean_view_name=clean_view_name,
+                            runtime_cfg=runtime_cfg,
+                            metadata_context=metadata_context,
+                            group_map=group_map,
+                            artifact_map=artifact_map,
+                            phase_map=phase_map,
+                            support_id_lookup=support_id_lookup,
+                            horizon_id=horizon_id_map[horizon],
+                            force_intervened_input=force_intervened_input,
+                            split_name="test",
+                            setting_meta={
+                                "dataset_name": dataset_name,
+                                "backbone": experiment_meta["backbone_name"],
+                                "lookback": lookback,
+                                "horizon": horizon,
+                                "train_view_name": experiment_meta["train_view_name"],
+                                "eval_view_name": eval_view_name,
+                                "checkpoint_variant": variant_name,
+                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                            },
+                        )
+                        checkpoint_rows.append(
+                            {
+                                "dataset_name": dataset_name,
+                                "backbone": experiment_meta["backbone_name"],
+                                "lookback": lookback,
+                                "horizon": horizon,
+                                "train_view_name": experiment_meta["train_view_name"],
+                                "eval_view_name": eval_view_name,
+                                "seed": seed,
+                                "checkpoint_variant": variant_name,
+                                "checkpoint_source_epochs": source_epochs_text,
+                                "selected_for_final": int(variant_name == "soup"),
+                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                                "n_train_windows": int(len(train_rows)),
+                                "n_eval_windows": int(len(eval_rows)),
+                                "epochs_ran": int(train_info["epochs_ran"]),
+                                "val_mae": round(float(variant_payload["val_metrics"]["mae"]), 6),
+                                "val_mse": round(float(variant_payload["val_metrics"]["mse"]), 6),
+                                "val_score": round(float(variant_payload["val_score"]), 6),
+                                "mae": round(float(metrics["mae"]), 6),
+                                "mse": round(float(metrics["mse"]), 6),
+                                "smape": round(float(metrics["smape"]), 6),
+                            }
+                        )
+                        if variant_name == "soup":
+                            result_rows.append(
+                                {
+                                    "dataset_name": dataset_name,
+                                    "backbone": experiment_meta["backbone_name"],
+                                    "lookback": lookback,
+                                    "horizon": horizon,
+                                    "train_view_name": experiment_meta["train_view_name"],
+                                    "eval_view_name": eval_view_name,
+                                    "seed": seed,
+                                    "checkpoint_variant": variant_name,
+                                    "checkpoint_source_epochs": source_epochs_text,
+                                    "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                                    "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                                    "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                                    "n_train_windows": int(len(train_rows)),
+                                    "n_eval_windows": int(len(eval_rows)),
+                                    "epochs_ran": int(train_info["epochs_ran"]),
+                                    "best_val_mae": round(float(variant_payload["val_metrics"]["mae"]), 6),
+                                    "best_val_mse": round(float(variant_payload["val_metrics"]["mse"]), 6),
+                                    "best_val_score": round(float(variant_payload["val_score"]), 6),
+                                    "mae": round(float(metrics["mae"]), 6),
+                                    "mse": round(float(metrics["mse"]), 6),
+                                    "smape": round(float(metrics["smape"]), 6),
+                                }
+                            )
+                            error_frames.append(errors)
+                        log_progress(
+                            f"done dataset={dataset_name} L{lookback} H{horizon} seed={seed} "
+                            f"variant={variant_name} view={eval_view_name} mae={float(metrics['mae']):.6f}"
+                        )
 
-    results_df = pd.DataFrame(result_rows)
-    window_errors_df = pd.concat(error_frames, ignore_index=True) if error_frames else pd.DataFrame()
+    results_df = sort_results_frame(pd.DataFrame(result_rows))
+    window_errors_df = sort_window_errors_frame(pd.concat(error_frames, ignore_index=True) if error_frames else pd.DataFrame())
+    checkpoint_df = sort_results_frame(pd.DataFrame(checkpoint_rows))
     arg_df = compute_aif_arg_table(results_df)
     wgr_df = compute_aif_wgr_table(window_errors_df)
     ri_df = compute_aif_ri_table(results_df)
@@ -1174,15 +1218,23 @@ def main() -> None:
     wgr_out = ROOT_DIR / Path(args.wgr_out)
     ri_out = ROOT_DIR / Path(args.ri_out)
     report_out = ROOT_DIR / Path(args.report_out)
-    for path in [results_out, window_errors_out, arg_out, wgr_out, ri_out, report_out]:
+    checkpoint_out = ROOT_DIR / Path(args.checkpoint_comparison_out) if args.checkpoint_comparison_out else None
+
+    output_paths = [results_out, window_errors_out, arg_out, wgr_out, ri_out, report_out]
+    if checkpoint_out is not None:
+        output_paths.append(checkpoint_out)
+    for path in output_paths:
         path.parent.mkdir(parents=True, exist_ok=True)
+
     results_df.to_csv(results_out, index=False)
     window_errors_df.to_csv(window_errors_out, index=False)
     arg_df.to_csv(arg_out, index=False)
     wgr_df.to_csv(wgr_out, index=False)
     ri_df.to_csv(ri_out, index=False)
+    if checkpoint_out is not None:
+        checkpoint_df.to_csv(checkpoint_out, index=False)
 
-    baseline_df = pd.read_csv(baseline_results_path) if baseline_results_path.exists() else pd.DataFrame()
+    baseline_df = pd.read_csv(baseline_results_path, low_memory=False) if baseline_results_path.exists() else pd.DataFrame()
     write_markdown(
         report_out,
         build_summary_markdown(
@@ -1191,6 +1243,7 @@ def main() -> None:
             arg_df,
             wgr_df,
             ri_df,
+            checkpoint_df=checkpoint_df,
             summary_title=experiment_meta["summary_title"],
             display_name=experiment_meta["display_name"],
             summary_note=experiment_meta["summary_note"],

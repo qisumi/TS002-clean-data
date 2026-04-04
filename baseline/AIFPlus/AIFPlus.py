@@ -1,28 +1,12 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import sys
-from typing import Any
+from typing import Any, Optional, Sequence
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-_BASELINE_DIR = Path(__file__).resolve().parents[1]
-if str(_BASELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(_BASELINE_DIR))
-
-from ts_refactor_common import (
-    AttentionBlock,
-    ClassifierHead,
-    FeedForward,
-    RevIN,
-    ScaleFrequencyEncoder,
-    StochasticDepth,
-    TemporalMixerBlock,
-    VariableAwareForecastHead,
-)
 
 
 @dataclass
@@ -30,33 +14,29 @@ class AIFPlusConfig:
     seq_len: int
     pred_len: int
     enc_in: int
-    metadata_num_dim: int = 10
-    artifact_vocab_size: int = 1
-    phase_vocab_size: int = 1
-    dataset_vocab_size: int = 1
-    support_vocab_size: int = 1
     horizon_vocab_size: int = 1
     d_model: int = 256
-    latent_dim: int = 256
-    expert_hidden: int = 384
-    head_rank: int = 32
-    patch_len: int = 16
-    patch_stride: int = 8
-    n_blocks: int = 3
+    dropout: float = 0.05
     n_heads: int = 8
+    n_patch_layers: int = 2
+    n_decoder_layers: int = 2
     ffn_ratio: int = 4
-    dropout: float = 0.1
-    stochastic_depth: float = 0.05
-    num_experts: int = 2
-    epsilon_nuisance: float = 0.05
-    use_diff_branch: bool = False
-    num_queries: int = 32
-    num_tq_layers: int = 1
-    query_period: int = 24
-    resid_hidden: int = 64
-    lambda_res_init: float = 0.01
-    lambda_res_max: float = 0.05
-    scales: tuple[int, ...] = (1, 2, 4)
+    use_diff_branch: bool = True
+
+    patch_len_small: int = 8
+    patch_stride_small: int = 4
+    patch_len_large: int = 16
+    patch_stride_large: int = 8
+    patch_jitter: bool = True
+
+    periods: tuple[int, ...] = (24, 48, 96)
+    queries_per_period: int = 2
+    spectral_topk: int = 8
+
+    residual_hidden: int = 32
+    lambda_res_max: float = 0.03
+
+    eps: float = 1e-5
 
 
 def _compatible_heads(requested_heads: int, d_model: int) -> int:
@@ -68,62 +48,129 @@ def _compatible_heads(requested_heads: int, d_model: int) -> int:
     return 1
 
 
-class GradientReversalFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, x: torch.Tensor, alpha: float) -> torch.Tensor:
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        return -ctx.alpha * grad_output, None
-
-
-class GradientReversal(nn.Module):
-    def __init__(self, alpha: float = 1.0) -> None:
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, affine: bool = True, eps: float = 1e-5) -> None:
         super().__init__()
-        self.alpha = float(alpha)
+        self.num_features = int(num_features)
+        self.affine = bool(affine)
+        self.eps = float(eps)
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(1, 1, self.num_features))
+            self.bias = nn.Parameter(torch.zeros(1, 1, self.num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def normalize(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps)
+        x_hat = (x - mean) / std
+        if self.affine:
+            x_hat = x_hat * self.weight + self.bias
+        return x_hat, (mean, std)
+
+    def denormalize(self, x_hat: torch.Tensor, stats: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        mean, std = stats
+        if self.affine:
+            x_hat = (x_hat - self.bias) / self.weight.clamp_min(self.eps)
+        return x_hat * std + mean
+
+
+class StochasticDepth(nn.Module):
+    def __init__(self, p: float = 0.0) -> None:
+        super().__init__()
+        self.p = float(max(0.0, min(1.0, p)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return GradientReversalFunction.apply(x, self.alpha)
+        if not self.training or self.p == 0.0:
+            return x
+        keep_prob = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, ffn_ratio: int, dropout: float, drop_path: float = 0.0) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=_compatible_heads(n_heads, d_model),
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward(d_model, d_model * ffn_ratio, dropout)
+        self.drop_path1 = StochasticDepth(drop_path)
+        self.drop_path2 = StochasticDepth(drop_path)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+        x = x + self.drop_path1(attn_out)
+        x = x + self.drop_path2(self.ffn(self.norm2(x)))
+        return x
 
 
 class CrossAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        ffn_ratio: int,
-        dropout: float,
-        drop_path: float,
-    ) -> None:
+    def __init__(self, d_model: int, n_heads: int, ffn_ratio: int, dropout: float, drop_path: float = 0.0) -> None:
         super().__init__()
         self.norm_q = nn.LayerNorm(d_model)
-        self.norm_ctx = nn.LayerNorm(d_model)
-        self.cross = nn.MultiheadAttention(
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
-            num_heads=n_heads,
+            num_heads=_compatible_heads(n_heads, d_model),
             dropout=dropout,
             batch_first=True,
         )
         self.norm_ffn = nn.LayerNorm(d_model)
         self.ffn = FeedForward(d_model, d_model * ffn_ratio, dropout)
-        self.drop_path = StochasticDepth(drop_path)
+        self.drop_path1 = StochasticDepth(drop_path)
+        self.drop_path2 = StochasticDepth(drop_path)
 
     def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        q = self.norm_q(query)
-        ctx = self.norm_ctx(context)
-        out, _ = self.cross(q, ctx, ctx, need_weights=False)
-        query = query + self.drop_path(out)
-        query = query + self.drop_path(self.ffn(self.norm_ffn(query)))
+        out, _ = self.attn(self.norm_q(query), self.norm_kv(context), self.norm_kv(context), need_weights=False)
+        query = query + self.drop_path1(out)
+        query = query + self.drop_path2(self.ffn(self.norm_ffn(query)))
         return query
 
 
-class ChannelIndependentPatchEncoder(nn.Module):
+class ChannelMLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, out_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PatchBranch(nn.Module):
     def __init__(
         self,
         seq_len: int,
-        feature_dim: int,
+        in_channels: int,
         d_model: int,
         patch_len: int,
         patch_stride: int,
@@ -131,123 +178,99 @@ class ChannelIndependentPatchEncoder(nn.Module):
         n_heads: int,
         ffn_ratio: int,
         dropout: float,
-        stochastic_depth: float,
     ) -> None:
         super().__init__()
         self.seq_len = int(seq_len)
-        self.feature_dim = int(feature_dim)
+        self.in_channels = int(in_channels)
         self.d_model = int(d_model)
-        self.patch_embed = nn.Conv1d(
-            in_channels=self.feature_dim,
+        self.patch_len = int(patch_len)
+        self.patch_stride = int(patch_stride)
+
+        self.proj = nn.Conv1d(
+            in_channels=self.in_channels,
             out_channels=self.d_model,
-            kernel_size=int(patch_len),
-            stride=int(patch_stride),
-            padding=int(patch_len) // 2,
+            kernel_size=self.patch_len,
+            stride=self.patch_stride,
+            padding=self.patch_len // 2,
         )
         with torch.no_grad():
-            dummy = torch.zeros(1, self.feature_dim, self.seq_len)
-            token_len = int(self.patch_embed(dummy).shape[-1])
-        self.positional = nn.Parameter(torch.zeros(1, token_len, self.d_model))
-        self.layers = nn.ModuleList()
-        drop_rates = torch.linspace(0.0, float(stochastic_depth), steps=max(int(n_layers), 1)).tolist()
-        attn_heads = _compatible_heads(n_heads, self.d_model)
-        for idx in range(max(int(n_layers), 1)):
-            self.layers.append(
-                AttentionBlock(
+            dummy = torch.zeros(1, self.in_channels, self.seq_len)
+            token_len = int(self.proj(dummy).shape[-1])
+        self.pos = nn.Parameter(torch.zeros(1, token_len, self.d_model))
+        self.type_embed = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
                     d_model=self.d_model,
-                    n_heads=attn_heads,
+                    n_heads=n_heads,
                     ffn_ratio=ffn_ratio,
                     dropout=dropout,
-                    drop_path=drop_rates[idx],
+                    drop_path=0.0,
                 )
-            )
-        self.var_summary = nn.Sequential(
-            nn.LayerNorm(self.d_model * 3),
-            nn.Linear(self.d_model * 3, self.d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
+                for _ in range(max(1, int(n_layers)))
+            ]
         )
-        self.global_summary = nn.Sequential(
+        self.state_proj = nn.Sequential(
             nn.LayerNorm(self.d_model * 2),
             nn.Linear(self.d_model * 2, self.d_model),
             nn.GELU(),
             nn.Dropout(dropout),
         )
 
-    def forward(self, per_var_features: torch.Tensor) -> dict[str, torch.Tensor]:
-        if per_var_features.ndim != 4:
-            raise ValueError(f"Expected 4D input [B, L, C, F], got {tuple(per_var_features.shape)}")
-        batch_size, seq_len, n_vars, feature_dim = per_var_features.shape
-        if seq_len != self.seq_len or feature_dim != self.feature_dim:
-            raise ValueError(
-                "Unexpected per-variable feature shape. "
-                f"Expected [B, {self.seq_len}, C, {self.feature_dim}], "
-                f"got [B, {seq_len}, {n_vars}, {feature_dim}]"
-            )
+    def _apply_jitter(self, x: torch.Tensor, enabled: bool) -> torch.Tensor:
+        if not enabled:
+            return x
+        max_offset = max(self.patch_stride - 1, 0)
+        if max_offset == 0:
+            return x
+        offset = int(torch.randint(0, max_offset + 1, (1,), device=x.device).item())
+        if offset == 0:
+            return x
+        x = F.pad(x, (offset, 0), mode="replicate")
+        return x[..., :-offset]
 
-        x = per_var_features.permute(0, 2, 3, 1).reshape(batch_size * n_vars, self.feature_dim, self.seq_len)
-        patch_tokens = self.patch_embed(x).transpose(1, 2)
-        patch_tokens = patch_tokens + self.positional[:, : patch_tokens.shape[1], :]
+    def forward(self, x: torch.Tensor, patch_jitter: bool = False) -> dict[str, torch.Tensor]:
+        x = self._apply_jitter(x, enabled=patch_jitter and self.training)
+        tokens = self.proj(x).transpose(1, 2)
+        tokens = tokens + self.pos[:, : tokens.shape[1], :] + self.type_embed
         for layer in self.layers:
-            patch_tokens = layer(patch_tokens)
-
-        pooled = torch.cat(
-            [
-                patch_tokens.mean(dim=1),
-                patch_tokens.max(dim=1).values,
-                patch_tokens[:, -1, :],
-            ],
-            dim=-1,
-        )
-        var_tokens = self.var_summary(pooled).view(batch_size, n_vars, self.d_model)
-        global_state = self.global_summary(
-            torch.cat([var_tokens.mean(dim=1), var_tokens.max(dim=1).values], dim=-1)
-        )
-        return {
-            "patch_tokens": patch_tokens.view(batch_size, n_vars, patch_tokens.shape[1], self.d_model),
-            "var_tokens": var_tokens,
-            "state": global_state,
-        }
+            tokens = layer(tokens)
+        pooled = torch.cat([tokens.mean(dim=1), tokens.max(dim=1).values], dim=-1)
+        state = self.state_proj(pooled)
+        return {"tokens": tokens, "state": state}
 
 
-class PeriodicQueryCrossBranch(nn.Module):
+class PeriodicTokenEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
         n_heads: int,
-        num_queries: int,
-        num_layers: int,
-        query_period: int,
+        periods: Sequence[int],
+        queries_per_period: int,
+        n_layers: int,
         ffn_ratio: int,
         dropout: float,
-        stochastic_depth: float,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
-        self.num_queries = int(max(1, num_queries))
-        self.query_period = int(max(1, query_period))
-        self.query_bank = nn.Parameter(torch.zeros(1, self.num_queries, self.d_model))
-        self.period_embed = nn.Embedding(self.query_period, self.d_model)
-        self.layers = nn.ModuleList()
-        drop_rates = torch.linspace(0.0, float(stochastic_depth), steps=max(int(num_layers), 1)).tolist()
-        attn_heads = _compatible_heads(n_heads, self.d_model)
-        for idx in range(max(int(num_layers), 1)):
-            self.layers.append(
+        self.periods = tuple(int(max(1, p)) for p in periods)
+        self.queries_per_period = int(max(1, queries_per_period))
+        self.query_bank = nn.Parameter(torch.zeros(1, self.queries_per_period, self.d_model))
+        self.period_embed = nn.Embedding(len(self.periods), self.d_model)
+        self.layers = nn.ModuleList(
+            [
                 CrossAttentionBlock(
                     d_model=self.d_model,
-                    n_heads=attn_heads,
+                    n_heads=n_heads,
                     ffn_ratio=ffn_ratio,
                     dropout=dropout,
-                    drop_path=drop_rates[idx],
+                    drop_path=0.0,
                 )
-            )
-        self.summary = nn.Sequential(
-            nn.LayerNorm(self.d_model * 2),
-            nn.Linear(self.d_model * 2, self.d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
+                for _ in range(max(1, int(n_layers)))
+            ]
         )
-        self.var_fusion = nn.Sequential(
+        self.type_embed = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.state_proj = nn.Sequential(
             nn.LayerNorm(self.d_model * 2),
             nn.Linear(self.d_model * 2, self.d_model),
             nn.GELU(),
@@ -255,225 +278,280 @@ class PeriodicQueryCrossBranch(nn.Module):
         )
 
     def _build_queries(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        query_index = torch.arange(self.num_queries, device=device)
-        periodic_bias = self.period_embed(query_index % self.query_period)
-        return self.query_bank.expand(batch_size, -1, -1) + periodic_bias.unsqueeze(0)
+        queries = []
+        for idx, _ in enumerate(self.periods):
+            base = self.query_bank.expand(batch_size, -1, -1)
+            queries.append(base + self.period_embed.weight[idx].view(1, 1, -1))
+        return torch.cat(queries, dim=1)
 
-    def forward(self, var_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch_size = int(var_tokens.shape[0])
-        queries = self._build_queries(batch_size=batch_size, device=var_tokens.device)
+    def forward(self, patch_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
+        queries = self._build_queries(batch_size=patch_tokens.shape[0], device=patch_tokens.device)
+        queries = queries + self.type_embed
         for layer in self.layers:
-            queries = layer(queries, var_tokens)
-        state = self.summary(torch.cat([queries.mean(dim=1), queries.max(dim=1).values], dim=-1))
-        state_broadcast = state.unsqueeze(1).expand(-1, var_tokens.shape[1], -1)
-        refined_var_tokens = var_tokens + self.var_fusion(torch.cat([var_tokens, state_broadcast], dim=-1))
+            queries = layer(queries, patch_tokens)
+        pooled = torch.cat([queries.mean(dim=1), queries.max(dim=1).values], dim=-1)
+        state = self.state_proj(pooled)
+        return {"tokens": queries, "state": state}
+
+
+class FrequencyTokenEncoder(nn.Module):
+    def __init__(self, d_model: int, topk: int, dropout: float) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.topk = int(max(1, topk))
+        self.proj = nn.Sequential(
+            nn.LayerNorm(2),
+            nn.Linear(2, self.d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.d_model, self.d_model),
+        )
+        self.type_embed = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.state_proj = nn.Sequential(
+            nn.LayerNorm(self.d_model * 2),
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, series: torch.Tensor) -> dict[str, torch.Tensor]:
+        spectrum = torch.fft.rfft(series, dim=-1)
+        magnitude = spectrum.abs()
+        if magnitude.shape[-1] > 0:
+            magnitude[..., 0] = 0.0
+        k = min(self.topk, magnitude.shape[-1])
+        values, indices = torch.topk(magnitude, k=k, dim=-1)
+        denom = max(int(magnitude.shape[-1]) - 1, 1)
+        norm_indices = indices.float() / float(denom)
+        feats = torch.stack([torch.log1p(values), norm_indices], dim=-1)
+        tokens = self.proj(feats) + self.type_embed
+        pooled = torch.cat([tokens.mean(dim=1), tokens.max(dim=1).values], dim=-1)
+        state = self.state_proj(pooled)
+        return {"tokens": tokens, "state": state}
+
+
+class MultiPatchCIEncoder(nn.Module):
+    def __init__(self, config: AIFPlusConfig, feature_dim: int) -> None:
+        super().__init__()
+        self.branch_small = PatchBranch(
+            seq_len=config.seq_len,
+            in_channels=feature_dim,
+            d_model=config.d_model,
+            patch_len=config.patch_len_small,
+            patch_stride=config.patch_stride_small,
+            n_layers=config.n_patch_layers,
+            n_heads=config.n_heads,
+            ffn_ratio=config.ffn_ratio,
+            dropout=config.dropout,
+        )
+        self.branch_large = PatchBranch(
+            seq_len=config.seq_len,
+            in_channels=feature_dim,
+            d_model=config.d_model,
+            patch_len=config.patch_len_large,
+            patch_stride=config.patch_stride_large,
+            n_layers=config.n_patch_layers,
+            n_heads=config.n_heads,
+            ffn_ratio=config.ffn_ratio,
+            dropout=config.dropout,
+        )
+        self.task_proj = nn.Linear(config.d_model, 32)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(config.d_model * 2 + 32),
+            nn.Linear(config.d_model * 2 + 32, 64),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x: torch.Tensor, task_embed: torch.Tensor, patch_jitter: bool = False) -> dict[str, torch.Tensor]:
+        out_small = self.branch_small(x, patch_jitter=patch_jitter)
+        out_large = self.branch_large(x, patch_jitter=patch_jitter)
+        logits = self.gate(torch.cat([out_small["state"], out_large["state"], self.task_proj(task_embed)], dim=-1))
+        weights = torch.softmax(logits, dim=-1)
+        state = weights[:, :1] * out_small["state"] + weights[:, 1:2] * out_large["state"]
+        tokens = torch.cat([out_small["tokens"], out_large["tokens"]], dim=1)
         return {
-            "query_tokens": queries,
-            "var_tokens": refined_var_tokens,
+            "tokens": tokens,
             "state": state,
+            "branch_weights": weights,
         }
 
 
-class ArtifactResidualBranch(nn.Module):
+class HorizonQueryDecoder(nn.Module):
     def __init__(
         self,
-        seq_len: int,
-        feature_dim: int,
-        hidden_dim: int,
         pred_len: int,
-        n_vars: int,
-        rank: int,
-        head_hidden: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        ffn_ratio: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        self.seq_len = int(seq_len)
-        self.feature_dim = int(feature_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.n_vars = int(n_vars)
-        self.input_proj = nn.Conv1d(
-            in_channels=self.feature_dim,
-            out_channels=self.hidden_dim,
-            kernel_size=5,
-            padding=2,
+        self.pred_len = int(pred_len)
+        self.d_model = int(d_model)
+        self.horizon_queries = nn.Parameter(torch.zeros(1, self.pred_len, self.d_model))
+        self.seed_proj = nn.Sequential(
+            nn.LayerNorm(self.d_model * 2),
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-        self.mix_blocks = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
-                TemporalMixerBlock(
-                    d_model=self.hidden_dim,
-                    ffn_ratio=2,
+                CrossAttentionBlock(
+                    d_model=self.d_model,
+                    n_heads=n_heads,
+                    ffn_ratio=ffn_ratio,
                     dropout=dropout,
                     drop_path=0.0,
-                    kernel_size=5,
-                    dilation=1,
-                ),
-                TemporalMixerBlock(
-                    d_model=self.hidden_dim,
-                    ffn_ratio=2,
-                    dropout=dropout,
-                    drop_path=0.0,
-                    kernel_size=7,
-                    dilation=2,
-                ),
+                )
+                for _ in range(max(1, int(n_layers)))
             ]
         )
-        self.var_summary = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        self.norm = nn.LayerNorm(self.d_model)
+        self.out = nn.Linear(self.d_model, 1)
+
+    def forward(self, token_bank: torch.Tensor, global_state: torch.Tensor, task_embed: torch.Tensor) -> torch.Tensor:
+        seed = self.seed_proj(torch.cat([global_state, task_embed], dim=-1))
+        queries = self.horizon_queries + seed.unsqueeze(1)
+        for layer in self.layers:
+            queries = layer(queries, token_bank)
+        pred = self.out(self.norm(queries)).squeeze(-1)
+        return pred
+
+
+class DepthwiseTemporalBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dropout: float) -> None:
+        super().__init__()
+        padding = kernel_size // 2
+        self.dw = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding, groups=channels)
+        self.pw = nn.Conv1d(channels, channels, kernel_size=1)
+        self.norm = nn.BatchNorm1d(channels)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dw(x)
+        x = F.gelu(self.pw(x))
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x + residual
+
+
+class TinyResidualBranch(nn.Module):
+    def __init__(self, config: AIFPlusConfig, feature_dim: int, task_dim: int) -> None:
+        super().__init__()
+        self.pred_len = int(config.pred_len)
+        self.lambda_res_max = float(max(config.lambda_res_max, 0.0))
+        self.hidden = int(config.residual_hidden)
+        self.input_proj = nn.Conv1d(feature_dim, self.hidden, kernel_size=5, padding=2)
+        self.block = DepthwiseTemporalBlock(self.hidden, kernel_size=5, dropout=config.dropout)
+        self.state_proj = nn.Sequential(
+            nn.LayerNorm(self.hidden * 2),
+            nn.Linear(self.hidden * 2, self.hidden),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(config.dropout),
         )
-        self.state_summary = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        self.pred_head = nn.Sequential(
+            nn.LayerNorm(self.hidden + task_dim),
+            nn.Linear(self.hidden + task_dim, max(self.hidden * 2, 64)),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(config.dropout),
+            nn.Linear(max(self.hidden * 2, 64), self.pred_len),
         )
-        self.head = VariableAwareForecastHead(
-            state_dim=self.hidden_dim,
-            token_dim=self.hidden_dim,
-            hidden_dim=int(max(head_hidden // 2, self.hidden_dim * 2)),
-            out_len=int(pred_len),
-            n_vars=self.n_vars,
-            rank=max(8, int(rank) // 2),
-            dropout=dropout,
+        self.gate_head = nn.Sequential(
+            nn.LayerNorm(self.hidden + 2 + task_dim),
+            nn.Linear(self.hidden + 2 + task_dim, max(self.hidden * 2, 64)),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(max(self.hidden * 2, 64), 1),
         )
 
-    def forward(self, per_var_features: torch.Tensor) -> dict[str, torch.Tensor]:
-        if per_var_features.ndim != 4:
-            raise ValueError(f"Expected 4D input [B, L, C, F], got {tuple(per_var_features.shape)}")
-        batch_size, seq_len, n_vars, feature_dim = per_var_features.shape
-        if seq_len != self.seq_len or n_vars != self.n_vars or feature_dim != self.feature_dim:
-            raise ValueError(
-                "Unexpected residual feature shape. "
-                f"Expected [B, {self.seq_len}, {self.n_vars}, {self.feature_dim}], "
-                f"got [B, {seq_len}, {n_vars}, {feature_dim}]"
-            )
-        x = per_var_features.permute(0, 2, 3, 1).reshape(batch_size * self.n_vars, self.feature_dim, self.seq_len)
-        tokens = self.input_proj(x).transpose(1, 2)
-        for block in self.mix_blocks:
-            tokens = block(tokens)
-        pooled = torch.cat([tokens.mean(dim=1), tokens.max(dim=1).values], dim=-1)
-        var_tokens = self.var_summary(pooled).view(batch_size, self.n_vars, self.hidden_dim)
-        state = self.state_summary(torch.cat([var_tokens.mean(dim=1), var_tokens.max(dim=1).values], dim=-1))
-        return {
-            "pred": self.head(state, var_tokens),
-            "var_tokens": var_tokens,
-            "state": state,
-        }
+    def forward(self, delta_features: torch.Tensor, uncertainty_series: torch.Tensor, task_embed: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.input_proj(delta_features)
+        x = self.block(x)
+        pooled = torch.cat([x.mean(dim=-1), x.amax(dim=-1)], dim=-1)
+        state = self.state_proj(pooled)
+        uncertainty_stats = torch.stack(
+            [uncertainty_series.mean(dim=-1), uncertainty_series.amax(dim=-1)],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate_head(torch.cat([state, uncertainty_stats, task_embed], dim=-1))) * self.lambda_res_max
+        pred = self.pred_head(torch.cat([state, task_embed], dim=-1))
+        return {"pred": pred, "gate": gate, "state": state}
+
+
+class AIFPlusLoss(nn.Module):
+    def __init__(self, mae_weight: float = 0.7, mse_weight: float = 0.3) -> None:
+        super().__init__()
+        self.mae_weight = float(mae_weight)
+        self.mse_weight = float(mse_weight)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        mae = F.l1_loss(pred, target)
+        mse = F.mse_loss(pred, target)
+        loss = self.mae_weight * mae + self.mse_weight * mse
+        return {"loss": loss, "mae": mae, "mse": mse}
 
 
 class AIFPlus(nn.Module):
+    """
+    AIF-Plus-V4
+    - channel-independent clean trunk
+    - multi-patch + periodic + spectral tokens
+    - horizon-query decoder
+    - tiny per-channel residual branch
+    - no adversarial / pair / CVaR / reconstruction losses by default
+    """
+
     def __init__(self, config: AIFPlusConfig) -> None:
         super().__init__()
         self.config = config
         self.seq_len = int(config.seq_len)
         self.pred_len = int(config.pred_len)
         self.n_vars = int(config.enc_in)
-        self.d_model = int(config.d_model)
-        self.latent_dim = int(config.latent_dim)
         self.use_diff_branch = bool(config.use_diff_branch)
-        self.clean_feature_dim = 3 if self.use_diff_branch else 2
-        self.residual_feature_dim = 3 if self.use_diff_branch else 2
-        self.lambda_res_max = float(max(config.lambda_res_max, 0.0))
 
-        self.revin = RevIN(num_features=self.n_vars, affine=True)
-        self.uncertainty_proj = nn.Parameter(torch.tensor(0.2))
+        self.revin = RevIN(num_features=self.n_vars, affine=True, eps=config.eps)
 
-        self.clean_patch = ChannelIndependentPatchEncoder(
-            seq_len=self.seq_len,
-            feature_dim=self.clean_feature_dim,
-            d_model=self.d_model,
-            patch_len=int(config.patch_len),
-            patch_stride=int(config.patch_stride),
-            n_layers=max(2, int(config.n_blocks)),
-            n_heads=int(config.n_heads),
-            ffn_ratio=int(config.ffn_ratio),
-            dropout=float(config.dropout),
-            stochastic_depth=float(config.stochastic_depth),
-        )
-        self.cross_var_branch = PeriodicQueryCrossBranch(
-            d_model=self.d_model,
-            n_heads=int(config.n_heads),
-            num_queries=int(config.num_queries),
-            num_layers=max(1, int(config.num_tq_layers)),
-            query_period=int(config.query_period),
-            ffn_ratio=int(config.ffn_ratio),
-            dropout=float(config.dropout),
-            stochastic_depth=float(config.stochastic_depth) * 0.5,
-        )
-        self.scale_encoder = ScaleFrequencyEncoder(
-            n_vars=self.n_vars,
-            seq_len=self.seq_len,
-            d_model=self.d_model,
-            dropout=float(config.dropout),
-            scales=tuple(int(scale) for scale in config.scales),
-            spectral_topk=8,
-        )
-        self.horizon_embed = nn.Embedding(max(int(config.horizon_vocab_size), 1), 16)
-        self.clean_fusion = nn.Sequential(
-            nn.LayerNorm(self.d_model * 3 + 16),
-            nn.Linear(self.d_model * 3 + 16, self.latent_dim),
-            nn.GELU(),
-            nn.Dropout(float(config.dropout)),
-            nn.Linear(self.latent_dim, self.latent_dim),
-        )
-        self.local_head = VariableAwareForecastHead(
-            state_dim=self.latent_dim,
-            token_dim=self.d_model,
-            hidden_dim=int(config.expert_hidden),
-            out_len=self.pred_len,
-            n_vars=self.n_vars,
-            rank=int(config.head_rank),
-            dropout=float(config.dropout),
-        )
-        self.global_head = VariableAwareForecastHead(
-            state_dim=self.latent_dim,
-            token_dim=self.d_model,
-            hidden_dim=int(config.expert_hidden),
-            out_len=self.pred_len,
-            n_vars=self.n_vars,
-            rank=int(config.head_rank),
-            dropout=float(config.dropout),
-        )
-        self.reconstruction_head = VariableAwareForecastHead(
-            state_dim=self.latent_dim,
-            token_dim=self.d_model,
-            hidden_dim=int(max(config.expert_hidden // 2, config.latent_dim)),
-            out_len=self.seq_len,
-            n_vars=self.n_vars,
-            rank=max(16, int(config.head_rank) // 2),
-            dropout=float(config.dropout),
-        )
-        self.artifact_branch = ArtifactResidualBranch(
-            seq_len=self.seq_len,
-            feature_dim=self.residual_feature_dim,
-            hidden_dim=int(config.resid_hidden),
-            pred_len=self.pred_len,
-            n_vars=self.n_vars,
-            rank=int(config.head_rank),
-            head_hidden=int(config.expert_hidden),
-            dropout=float(config.dropout),
-        )
-        self.art_state_proj = nn.Sequential(
-            nn.LayerNorm(int(config.resid_hidden)),
-            nn.Linear(int(config.resid_hidden), self.latent_dim),
-            nn.GELU(),
-            nn.Dropout(float(config.dropout)),
-            nn.Linear(self.latent_dim, self.latent_dim),
-        )
+        self.task_embed = nn.Embedding(max(int(config.horizon_vocab_size), 1), int(config.d_model))
+        self.feature_dim = 2 if self.use_diff_branch else 1
 
-        if self.lambda_res_max > 0.0:
-            ratio = min(max(float(config.lambda_res_init) / self.lambda_res_max, 1e-4), 1.0 - 1e-4)
-            self.lambda_res_logit = nn.Parameter(torch.logit(torch.tensor(ratio, dtype=torch.float32)))
-        else:
-            self.lambda_res_logit = nn.Parameter(torch.tensor(-12.0))
-
-        self.grl = GradientReversal(alpha=1.0)
-        self.artifact_adv_head = ClassifierHead(self.latent_dim, int(config.artifact_vocab_size), float(config.dropout))
-        self.phase_adv_head = ClassifierHead(self.latent_dim, int(config.phase_vocab_size), float(config.dropout))
-        self.artifact_aux_head = ClassifierHead(self.latent_dim, int(config.artifact_vocab_size), float(config.dropout))
-        self.phase_aux_head = ClassifierHead(self.latent_dim, int(config.phase_vocab_size), float(config.dropout))
+        self.encoder = MultiPatchCIEncoder(config=config, feature_dim=self.feature_dim)
+        self.periodic = PeriodicTokenEncoder(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            periods=config.periods,
+            queries_per_period=config.queries_per_period,
+            n_layers=1,
+            ffn_ratio=config.ffn_ratio,
+            dropout=config.dropout,
+        )
+        self.frequency = FrequencyTokenEncoder(
+            d_model=config.d_model,
+            topk=config.spectral_topk,
+            dropout=config.dropout,
+        )
+        self.global_state = ChannelMLP(
+            in_dim=config.d_model * 4,
+            out_dim=config.d_model,
+            dropout=config.dropout,
+        )
+        self.decoder = HorizonQueryDecoder(
+            pred_len=config.pred_len,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_decoder_layers,
+            ffn_ratio=config.ffn_ratio,
+            dropout=config.dropout,
+        )
+        self.residual = TinyResidualBranch(
+            config=config,
+            feature_dim=self.feature_dim,
+            task_dim=config.d_model,
+        )
 
     @staticmethod
     def _first_difference(x: torch.Tensor) -> torch.Tensor:
@@ -481,82 +559,91 @@ class AIFPlus(nn.Module):
         pad = torch.zeros_like(x[:, :1, :])
         return torch.cat([pad, diff], dim=1)
 
-    def _scaled_uncertainty(self, uncertainty: torch.Tensor) -> torch.Tensor:
-        return uncertainty * torch.tanh(self.uncertainty_proj)
-
-    def _build_clean_features(self, x: torch.Tensor, uncertainty: torch.Tensor) -> torch.Tensor:
-        uncertainty_scaled = self._scaled_uncertainty(uncertainty)
-        features = [x.unsqueeze(-1), uncertainty_scaled.unsqueeze(-1)]
+    def _build_clean_features(self, x_norm: torch.Tensor) -> torch.Tensor:
+        # [B, L, C] -> [B*C, F, L]
+        features = [x_norm.permute(0, 2, 1).unsqueeze(2)]
         if self.use_diff_branch:
-            features.append(self._first_difference(x).unsqueeze(-1))
-        return torch.cat(features, dim=-1)
+            diff = self._first_difference(x_norm).permute(0, 2, 1).unsqueeze(2)
+            features.append(diff)
+        feat = torch.cat(features, dim=2)  # [B, C, F, L]
+        return feat.reshape(x_norm.shape[0] * x_norm.shape[2], feat.shape[2], x_norm.shape[1])
 
-    def _build_residual_features(self, delta: torch.Tensor, uncertainty: torch.Tensor) -> torch.Tensor:
-        uncertainty_scaled = self._scaled_uncertainty(uncertainty)
-        features = [delta.unsqueeze(-1), uncertainty_scaled.unsqueeze(-1)]
+    def _build_delta_features(self, delta_norm: torch.Tensor) -> torch.Tensor:
+        features = [delta_norm.permute(0, 2, 1).unsqueeze(2)]
         if self.use_diff_branch:
-            features.append(self._first_difference(delta).unsqueeze(-1))
-        return torch.cat(features, dim=-1)
+            diff = self._first_difference(delta_norm).permute(0, 2, 1).unsqueeze(2)
+            features.append(diff)
+        feat = torch.cat(features, dim=2)
+        return feat.reshape(delta_norm.shape[0] * delta_norm.shape[2], feat.shape[2], delta_norm.shape[1])
 
-    def _residual_scale(self) -> torch.Tensor:
-        if self.lambda_res_max <= 0.0:
-            return self.lambda_res_logit.new_tensor(0.0)
-        return torch.sigmoid(self.lambda_res_logit) * self.lambda_res_max
+    def _expand_task_embed(self, horizon_id: torch.Tensor) -> torch.Tensor:
+        if horizon_id.ndim == 0:
+            horizon_id = horizon_id.view(1)
+        task = self.task_embed(horizon_id)  # [B, D]
+        task = task.unsqueeze(1).expand(-1, self.n_vars, -1)
+        return task.reshape(task.shape[0] * task.shape[1], task.shape[2])
 
     def forward(
         self,
         x_raw: torch.Tensor,
         x_masked: torch.Tensor,
         uncertainty: torch.Tensor,
-        metadata_num: torch.Tensor,
-        dataset_id: torch.Tensor,
-        support_id: torch.Tensor,
-        horizon_id: torch.Tensor,
+        metadata_num: Optional[torch.Tensor] = None,
+        dataset_id: Optional[torch.Tensor] = None,
+        support_id: Optional[torch.Tensor] = None,
+        horizon_id: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         del metadata_num, dataset_id, support_id
 
+        if horizon_id is None:
+            horizon_id = torch.zeros(x_raw.shape[0], dtype=torch.long, device=x_raw.device)
+        if horizon_id.ndim == 0:
+            horizon_id = horizon_id.view(1).expand(x_raw.shape[0])
+
         masked_norm, masked_stats = self.revin.normalize(x_masked)
-        clean_features = self._build_clean_features(masked_norm, uncertainty)
-        patch_context = self.clean_patch(clean_features)
-        tq_context = self.cross_var_branch(patch_context["var_tokens"])
-        scale_tokens, scale_state = self.scale_encoder(masked_norm)
 
-        horizon_state = self.horizon_embed(horizon_id)
-        clean_state = self.clean_fusion(
-            torch.cat(
-                [
-                    patch_context["state"],
-                    tq_context["state"],
-                    scale_state,
-                    horizon_state,
-                ],
-                dim=-1,
-            )
+        clean_features = self._build_clean_features(masked_norm)
+        task_embed = self._expand_task_embed(horizon_id)
+
+        enc = self.encoder(
+            clean_features,
+            task_embed=task_embed,
+            patch_jitter=bool(self.config.patch_jitter),
         )
+        period = self.periodic(enc["tokens"])
+        # use the normalized masked series for spectral tokens, channel-independent
+        masked_series_bc = masked_norm.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
+        freq = self.frequency(masked_series_bc)
 
-        pred_clean_norm = self.local_head(clean_state, patch_context["var_tokens"]) + self.global_head(
-            clean_state,
-            tq_context["var_tokens"],
+        token_bank = torch.cat([enc["tokens"], period["tokens"], freq["tokens"]], dim=1)
+        global_state = self.global_state(
+            torch.cat([enc["state"], period["state"], freq["state"], task_embed], dim=-1)
         )
-        rec_norm = self.reconstruction_head(clean_state, patch_context["var_tokens"])
+        pred_clean_norm_bc = self.decoder(token_bank=token_bank, global_state=global_state, task_embed=task_embed)
 
-        delta = x_raw - x_masked
-        art_context = self.artifact_branch(self._build_residual_features(delta, uncertainty))
-        residual_scale = self._residual_scale()
-        pred_norm = pred_clean_norm + residual_scale * art_context["pred"]
-        z_art = self.art_state_proj(art_context["state"])
+        mean_masked, std_masked = masked_stats
+        delta_norm = (x_raw - x_masked) / std_masked.clamp_min(self.config.eps)
+        delta_features = self._build_delta_features(delta_norm)
+        uncertainty_bc = uncertainty.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
+        residual_out = self.residual(delta_features=delta_features, uncertainty_series=uncertainty_bc, task_embed=task_embed)
+
+        pred_norm_bc = pred_clean_norm_bc + residual_out["gate"] * residual_out["pred"]
+
+        pred_clean_norm = pred_clean_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+        pred_norm = pred_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+        residual_norm = (residual_out["gate"] * residual_out["pred"]).view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+
+        pred = self.revin.denormalize(pred_norm, masked_stats)
+        pred_clean = self.revin.denormalize(pred_clean_norm, masked_stats)
+        residual = residual_norm * std_masked
 
         return {
-            "pred": self.revin.denormalize(pred_norm, masked_stats),
-            "reconstruction": self.revin.denormalize(rec_norm, masked_stats),
-            "lambda_res": residual_scale.detach(),
-            "z_clean": clean_state,
-            "z_art": z_art,
-            "scale_tokens": scale_tokens,
-            "artifact_logits_clean": self.artifact_adv_head(self.grl(clean_state)),
-            "phase_logits_clean": self.phase_adv_head(self.grl(clean_state)),
-            "artifact_logits_art": self.artifact_aux_head(z_art),
-            "phase_logits_art": self.phase_aux_head(z_art),
+            "pred": pred,
+            "pred_clean": pred_clean,
+            "pred_residual": residual,
+            "lambda_res": residual_out["gate"].view(x_raw.shape[0], self.n_vars),
+            "branch_weights": enc["branch_weights"].view(x_raw.shape[0], self.n_vars, 2),
+            "task_embed": task_embed.view(x_raw.shape[0], self.n_vars, -1),
         }
 
     @torch.no_grad()
@@ -565,10 +652,10 @@ class AIFPlus(nn.Module):
         x_raw: torch.Tensor,
         x_masked: torch.Tensor,
         uncertainty: torch.Tensor,
-        metadata_num: torch.Tensor,
-        dataset_id: torch.Tensor,
-        support_id: torch.Tensor,
-        horizon_id: torch.Tensor,
+        metadata_num: Optional[torch.Tensor] = None,
+        dataset_id: Optional[torch.Tensor] = None,
+        support_id: Optional[torch.Tensor] = None,
+        horizon_id: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.forward(
             x_raw=x_raw,

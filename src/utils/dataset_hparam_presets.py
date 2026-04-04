@@ -457,6 +457,17 @@ def _copy_dict(value: dict[str, Any] | None) -> dict[str, Any]:
     return deepcopy(value or {})
 
 
+def _merge_nested_dict(base: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
+    if not override:
+        return base
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _merge_nested_dict(_copy_dict(base[key]), value)
+        else:
+            base[key] = deepcopy(value)
+    return base
+
+
 def _resolve_aux_label_mode(defaults: dict[str, Any]) -> str:
     mode = str(defaults.get("aux_label_mode", "with_aux_labels")).strip() or "with_aux_labels"
     if mode not in {"label_free_aux", "public_benchmark", "with_aux_labels"}:
@@ -470,12 +481,12 @@ def _default_eval_batch_size(batch_size: int) -> int:
 
 def _apply_common_runtime(runtime_cfg: dict[str, Any]) -> dict[str, Any]:
     runtime_cfg = _copy_dict(runtime_cfg)
-    runtime_cfg["betas"] = tuple(float(value) for value in COMMON_TRAINING["betas"])
-    runtime_cfg["grad_clip"] = float(COMMON_TRAINING["grad_clip"])
-    runtime_cfg["amp"] = bool(COMMON_TRAINING["amp"])
-    runtime_cfg["warmup_ratio"] = float(COMMON_TRAINING["warmup_ratio"])
-    runtime_cfg["optimizer"] = str(COMMON_TRAINING["optimizer"])
-    runtime_cfg["scheduler"] = str(COMMON_TRAINING["scheduler"])
+    runtime_cfg.setdefault("betas", tuple(float(value) for value in COMMON_TRAINING["betas"]))
+    runtime_cfg.setdefault("grad_clip", float(COMMON_TRAINING["grad_clip"]))
+    runtime_cfg.setdefault("amp", bool(COMMON_TRAINING["amp"]))
+    runtime_cfg.setdefault("warmup_ratio", float(COMMON_TRAINING["warmup_ratio"]))
+    runtime_cfg.setdefault("optimizer", str(COMMON_TRAINING["optimizer"]))
+    runtime_cfg.setdefault("scheduler", str(COMMON_TRAINING["scheduler"]))
     return runtime_cfg
 
 
@@ -563,7 +574,6 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
     model_cfg = _copy_dict(defaults.get("model"))
     loss_cfg = _copy_dict(defaults.get("loss"))
     stage_cfg = _copy_dict(defaults.get("stages"))
-    base_runtime_cfg = _copy_dict(defaults.get("runtime"))
 
     use_dataset_presets = bool(defaults.get("use_dataset_presets", False))
     use_preset_lookback = bool(defaults.get("use_preset_lookback", False))
@@ -619,6 +629,19 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
             if prefer_config_model_over_presets:
                 source_note += " Explicit model keys in config take priority over preset model values."
 
+    dataset_overrides = defaults.get("dataset_overrides", {})
+    if isinstance(dataset_overrides, dict):
+        dataset_override = dataset_overrides.get(dataset_name)
+        if isinstance(dataset_override, dict):
+            if "lookback" in dataset_override:
+                lookback = int(dataset_override["lookback"])
+            runtime_cfg = _merge_nested_dict(runtime_cfg, dataset_override.get("runtime"))
+            model_cfg = _merge_nested_dict(model_cfg, dataset_override.get("model"))
+            loss_cfg = _merge_nested_dict(loss_cfg, dataset_override.get("loss"))
+            stage_cfg = _merge_nested_dict(stage_cfg, dataset_override.get("stages"))
+            source_note += " Applied dataset_overrides from config."
+
+    base_runtime_cfg = _copy_dict(runtime_cfg)
     runtime_cfg = _apply_common_runtime(runtime_cfg)
     aux_cfg = _copy_dict(COMMON_TRAINING[aux_label_mode]["AIF"])
     loss_cfg.setdefault("gamma_rec", float(aux_cfg.pop("lambda_reconstruction")))
