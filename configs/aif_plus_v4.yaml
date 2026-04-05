@@ -57,6 +57,7 @@ defaults:
     grad_clip: 1.0
     warmup_ratio: 0.05
     amp: true
+    data_parallel: auto
     pin_memory: true
     num_workers: 0
     patience: 8

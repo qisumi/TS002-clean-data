@@ -122,6 +122,69 @@ class ModelEMA:
         self.shadow.load_state_dict(state_dict)
 
 
+class AIFPlusDataParallel(nn.DataParallel):
+    @torch.no_grad()
+    def predict(
+        self,
+        x_raw: torch.Tensor,
+        x_masked: torch.Tensor,
+        uncertainty: torch.Tensor,
+        metadata_num: torch.Tensor | None = None,
+        dataset_id: torch.Tensor | None = None,
+        support_id: torch.Tensor | None = None,
+        horizon_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward(
+            x_raw=x_raw,
+            x_masked=x_masked,
+            uncertainty=uncertainty,
+            metadata_num=metadata_num,
+            dataset_id=dataset_id,
+            support_id=support_id,
+            horizon_id=horizon_id,
+        )["pred"]
+
+
+def maybe_enable_data_parallel(
+    model: nn.Module,
+    *,
+    device: torch.device,
+    runtime_cfg: dict[str, Any],
+    log_prefix: str,
+) -> nn.Module:
+    raw_setting = runtime_cfg.get("data_parallel", "auto")
+    setting = str(raw_setting).strip().lower()
+    disabled_values = {"0", "false", "no", "off", "disabled"}
+    enabled_values = {"1", "true", "yes", "on", "enabled"}
+
+    if setting in disabled_values:
+        return model
+    if setting not in enabled_values and setting != "auto":
+        raise ValueError(f"Unsupported runtime.data_parallel={raw_setting!r}; expected auto/true/false")
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return model
+
+    visible_gpu_count = int(torch.cuda.device_count())
+    if visible_gpu_count <= 1:
+        return model
+
+    primary_device = 0 if device.index is None else int(device.index)
+    if primary_device < 0 or primary_device >= visible_gpu_count:
+        log_progress(
+            f"{log_prefix} skip data_parallel because primary_device={primary_device} is outside "
+            f"visible_gpu_count={visible_gpu_count}"
+        )
+        return model
+
+    device_ids = [primary_device] + [idx for idx in range(visible_gpu_count) if idx != primary_device]
+    model.to(torch.device("cuda", primary_device))
+    log_progress(
+        f"{log_prefix} enable data_parallel visible_gpu_count={visible_gpu_count} "
+        f"device_ids={','.join(str(item) for item in device_ids)}"
+    )
+    return AIFPlusDataParallel(model, device_ids=device_ids, output_device=primary_device)
+
+
 def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
     raw_betas = runtime_cfg.get("betas", (0.9, 0.999))
     if isinstance(raw_betas, (list, tuple)) and len(raw_betas) == 2:
@@ -574,7 +637,7 @@ def build_model_config(
 
 def fit_aif_v4(
     *,
-    model: AIFPlus,
+    model: nn.Module,
     ema: ModelEMA | None,
     train_loader: DataLoader[Any],
     val_rows: pd.DataFrame,
@@ -1048,6 +1111,7 @@ def main() -> None:
             }
 
             for seed in seeds:
+                log_prefix = f"{dataset_name}/L{lookback}/H{horizon}/seed{seed}"
                 set_random_seed(seed)
                 device = resolve_device(str(runtime_cfg.get("device", "auto")))
                 model = AIFPlus(
@@ -1060,6 +1124,12 @@ def main() -> None:
                     )
                 )
                 model.to(device)
+                model = maybe_enable_data_parallel(
+                    model,
+                    device=device,
+                    runtime_cfg=runtime_cfg,
+                    log_prefix=log_prefix,
+                )
                 ema = ModelEMA(model, decay=float(runtime_cfg.get("ema_decay", 0.999))) if bool(runtime_cfg.get("use_ema", True)) else None
                 pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
                 train_loader = build_loader(
@@ -1082,7 +1152,6 @@ def main() -> None:
                     pin_memory=pin_memory,
                 )
 
-                log_prefix = f"{dataset_name}/L{lookback}/H{horizon}/seed{seed}"
                 train_info = fit_aif_v4(
                     model=model,
                     ema=ema,

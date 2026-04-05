@@ -23,14 +23,39 @@ if [[ "${#PLAN_GPU_IDS_ARR[@]}" -eq 0 ]]; then
 fi
 
 PLAN_AIF_V4_DATASETS=("${PLAN_DATASETS_ARR[@]}")
-PLAN_AIF_V4_WORKER_COUNT="${#PLAN_GPU_IDS_ARR[@]}"
+PLAN_AIF_V4_GPUS_PER_TASK="${PLAN_AIF_V4_GPUS_PER_TASK:-1}"
+if ! [[ "${PLAN_AIF_V4_GPUS_PER_TASK}" =~ ^[0-9]+$ ]] || (( PLAN_AIF_V4_GPUS_PER_TASK <= 0 )); then
+  plan_log "PLAN_AIF_V4_GPUS_PER_TASK must be a positive integer; got ${PLAN_AIF_V4_GPUS_PER_TASK}"
+  exit 1
+fi
+
+PLAN_AIF_V4_TOTAL_GPUS="${PLAN_AIF_V4_TOTAL_GPUS:-${#PLAN_GPU_IDS_ARR[@]}}"
+if ! [[ "${PLAN_AIF_V4_TOTAL_GPUS}" =~ ^[0-9]+$ ]] || (( PLAN_AIF_V4_TOTAL_GPUS <= 0 )); then
+  plan_log "PLAN_AIF_V4_TOTAL_GPUS must be a positive integer; got ${PLAN_AIF_V4_TOTAL_GPUS}"
+  exit 1
+fi
+if (( PLAN_AIF_V4_TOTAL_GPUS > ${#PLAN_GPU_IDS_ARR[@]} )); then
+  plan_log "PLAN_AIF_V4_TOTAL_GPUS=${PLAN_AIF_V4_TOTAL_GPUS} exceeds visible GPUs=${#PLAN_GPU_IDS_ARR[@]}; cap to visible GPUs"
+  PLAN_AIF_V4_TOTAL_GPUS="${#PLAN_GPU_IDS_ARR[@]}"
+fi
+
+PLAN_AIF_V4_GPU_IDS=("${PLAN_GPU_IDS_ARR[@]:0:${PLAN_AIF_V4_TOTAL_GPUS}}")
+PLAN_AIF_V4_GROUP_CAPACITY=$(( ${#PLAN_AIF_V4_GPU_IDS[@]} / PLAN_AIF_V4_GPUS_PER_TASK ))
+PLAN_AIF_V4_WORKER_COUNT="${PLAN_AIF_V4_GROUP_CAPACITY}"
 if (( PLAN_AIF_V4_WORKER_COUNT > ${#PLAN_AIF_V4_DATASETS[@]} )); then
   PLAN_AIF_V4_WORKER_COUNT="${#PLAN_AIF_V4_DATASETS[@]}"
 fi
 if (( PLAN_AIF_V4_WORKER_COUNT <= 0 )); then
-  plan_log "no datasets selected for AIF-Plus-V4"
+  plan_log "insufficient GPUs for AIF-Plus-V4: selected_gpus=${#PLAN_AIF_V4_GPU_IDS[@]} gpus_per_task=${PLAN_AIF_V4_GPUS_PER_TASK}"
   exit 1
 fi
+
+PLAN_AIF_V4_GPU_GROUPS=()
+for ((worker_idx = 0; worker_idx < PLAN_AIF_V4_WORKER_COUNT; worker_idx++)); do
+  gpu_start=$(( worker_idx * PLAN_AIF_V4_GPUS_PER_TASK ))
+  gpu_group=("${PLAN_AIF_V4_GPU_IDS[@]:gpu_start:PLAN_AIF_V4_GPUS_PER_TASK}")
+  PLAN_AIF_V4_GPU_GROUPS[worker_idx]="$(join_by_comma "${gpu_group[@]}")"
+done
 
 if [[ "${RESULTS_DIR}" == /* ]]; then
   RESULTS_DIR_ABS="${RESULTS_DIR}"
@@ -51,9 +76,13 @@ trap 'cleanup_plan_temp_dir "${PLAN_AIF_V4_TMP_DIR}"' EXIT
 partition_items_round_robin PLAN_AIF_V4_DATASETS "${PLAN_AIF_V4_WORKER_COUNT}" PLAN_AIF_V4_DATASET_GROUPS
 
 plan_log "datasets=$(join_by_comma "${PLAN_AIF_V4_DATASETS[@]}")"
-plan_log "gpus=$(join_by_comma "${PLAN_GPU_IDS_ARR[@]}")"
-plan_log "worker_count=${PLAN_AIF_V4_WORKER_COUNT} threads_per_worker=${PLAN_AIF_V4_THREADS} dataloader_workers=${PLAN_AIF_V4_NUM_WORKERS}"
+plan_log "visible_gpus=$(join_by_comma "${PLAN_GPU_IDS_ARR[@]}")"
+plan_log "selected_gpus=$(join_by_comma "${PLAN_AIF_V4_GPU_IDS[@]}") gpus_per_task=${PLAN_AIF_V4_GPUS_PER_TASK} worker_count=${PLAN_AIF_V4_WORKER_COUNT}"
+plan_log "threads_per_worker=${PLAN_AIF_V4_THREADS} dataloader_workers=${PLAN_AIF_V4_NUM_WORKERS}"
 plan_log "config=${AIF_PLUS_V4_CONFIG}"
+if (( ${#PLAN_AIF_V4_GPU_IDS[@]} % PLAN_AIF_V4_GPUS_PER_TASK != 0 )); then
+  plan_log "ignore trailing GPUs because selected_gpus is not divisible by gpus_per_task"
+fi
 
 plan_bg_reset
 for ((worker_idx = 0; worker_idx < PLAN_AIF_V4_WORKER_COUNT; worker_idx++)); do
@@ -61,7 +90,7 @@ for ((worker_idx = 0; worker_idx < PLAN_AIF_V4_WORKER_COUNT; worker_idx++)); do
   if [[ -z "${dataset_group}" ]]; then
     continue
   fi
-  gpu_id="${PLAN_GPU_IDS_ARR[worker_idx]}"
+  gpu_id="${PLAN_AIF_V4_GPU_GROUPS[worker_idx]}"
   shard_dir="${PLAN_AIF_V4_TMP_DIR}/shard_${worker_idx}"
   shard_config="${PLAN_AIF_V4_TMP_DIR}/aif_plus_v4_shard_${worker_idx}.yaml"
   mkdir -p "${shard_dir}"
