@@ -661,11 +661,12 @@ class AIFPlus(nn.Module):
         masked_series_bc: torch.Tensor,
         task_embed: torch.Tensor,
         channel_state_bc: torch.Tensor,
+        return_aux: bool,
     ) -> dict[str, torch.Tensor]:
         total = int(clean_features.shape[0])
         chunk_size = total if self.bc_chunk_size <= 0 else min(self.bc_chunk_size, total)
         pred_clean_chunks: list[torch.Tensor] = []
-        branch_weight_chunks: list[torch.Tensor] = []
+        branch_weight_chunks: list[torch.Tensor] | None = [] if return_aux else None
 
         for start in range(0, total, chunk_size):
             end = min(start + chunk_size, total)
@@ -698,12 +699,15 @@ class AIFPlus(nn.Module):
             pred_clean_chunks.append(
                 self.decoder(token_bank=token_bank, global_state=global_state, task_embed=task_embed[start:end])
             )
-            branch_weight_chunks.append(enc["branch_weights"])
+            if branch_weight_chunks is not None:
+                branch_weight_chunks.append(enc["branch_weights"])
 
-        return {
+        outputs = {
             "pred_clean": torch.cat(pred_clean_chunks, dim=0),
-            "branch_weights": torch.cat(branch_weight_chunks, dim=0),
         }
+        if branch_weight_chunks is not None:
+            outputs["branch_weights"] = torch.cat(branch_weight_chunks, dim=0)
+        return outputs
 
     def forward(
         self,
@@ -714,6 +718,7 @@ class AIFPlus(nn.Module):
         dataset_id: Optional[torch.Tensor] = None,
         support_id: Optional[torch.Tensor] = None,
         horizon_id: Optional[torch.Tensor] = None,
+        return_aux: bool = True,
     ) -> dict[str, torch.Tensor]:
         del metadata_num, dataset_id, support_id
 
@@ -735,6 +740,7 @@ class AIFPlus(nn.Module):
             masked_series_bc=masked_series_bc,
             task_embed=task_embed,
             channel_state_bc=channel_state_bc,
+            return_aux=return_aux,
         )
         pred_clean_norm_bc = clean_out["pred_clean"]
 
@@ -746,11 +752,14 @@ class AIFPlus(nn.Module):
 
         pred_norm_bc = pred_clean_norm_bc + residual_out["gate"] * residual_out["pred"]
 
-        pred_clean_norm = pred_clean_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
         pred_norm = pred_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
-        residual_norm = (residual_out["gate"] * residual_out["pred"]).view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
 
         pred = self.revin.denormalize(pred_norm, masked_stats)
+        if not return_aux:
+            return {"pred": pred}
+
+        pred_clean_norm = pred_clean_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+        residual_norm = (residual_out["gate"] * residual_out["pred"]).view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
         pred_clean = self.revin.denormalize(pred_clean_norm, masked_stats)
         residual = residual_norm * std_masked
 
@@ -782,4 +791,5 @@ class AIFPlus(nn.Module):
             dataset_id=dataset_id,
             support_id=support_id,
             horizon_id=horizon_id,
+            return_aux=False,
         )["pred"]

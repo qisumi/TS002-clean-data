@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
+import gc
 import importlib.util
 import math
 import sys
@@ -111,18 +113,49 @@ class ModelEMA:
             shadow_device = next(base_model.parameters()).device
         else:
             shadow_device = torch.device(target_device)
+        self._shadow_device = shadow_device
         self.shadow.to(shadow_device)
         for param in self.shadow.parameters():
             param.requires_grad_(False)
+        self._state_names = tuple(self.shadow.state_dict().keys())
+        self._update_scratch_state: dict[str, torch.Tensor] = {}
+        self._backup_state: dict[str, torch.Tensor] = (
+            self._update_scratch_state if self._shadow_device.type == "cpu" else {}
+        )
+        self._backup_ready = False
+
+    @staticmethod
+    def _ensure_tensor_slot(
+        storage: dict[str, torch.Tensor],
+        name: str,
+        reference: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        scratch = storage.get(name)
+        if scratch is None or scratch.shape != reference.shape or scratch.dtype != reference.dtype or scratch.device != device:
+            scratch = torch.empty_like(reference, device=device)
+            storage[name] = scratch
+        return scratch
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        if self._backup_ready:
+            raise RuntimeError("EMA update called while a live model backup is still active")
         model_state = unwrap_model(model).state_dict()
         shadow_state = self.shadow.state_dict()
-        for name, value in shadow_state.items():
+        for name in self._state_names:
+            value = shadow_state[name]
             source = model_state[name].detach()
             if source.device != value.device:
-                source = source.to(device=value.device)
+                source_cpu = self._ensure_tensor_slot(
+                    self._update_scratch_state,
+                    name,
+                    value,
+                    device=value.device,
+                )
+                source_cpu.copy_(source, non_blocking=False)
+                source = source_cpu
             if not torch.is_floating_point(source):
                 value.copy_(source)
                 continue
@@ -134,68 +167,35 @@ class ModelEMA:
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.shadow.load_state_dict(state_dict)
 
-
-class AIFPlusDataParallel(nn.DataParallel):
     @torch.no_grad()
-    def predict(
-        self,
-        x_raw: torch.Tensor,
-        x_masked: torch.Tensor,
-        uncertainty: torch.Tensor,
-        metadata_num: torch.Tensor | None = None,
-        dataset_id: torch.Tensor | None = None,
-        support_id: torch.Tensor | None = None,
-        horizon_id: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.forward(
-            x_raw=x_raw,
-            x_masked=x_masked,
-            uncertainty=uncertainty,
-            metadata_num=metadata_num,
-            dataset_id=dataset_id,
-            support_id=support_id,
-            horizon_id=horizon_id,
-        )["pred"]
+    def store(self, model: nn.Module) -> None:
+        model_state = unwrap_model(model).state_dict()
+        shadow_state = self.shadow.state_dict()
+        for name in self._state_names:
+            backup = self._ensure_tensor_slot(
+                self._backup_state,
+                name,
+                shadow_state[name],
+                device=torch.device("cpu"),
+            )
+            backup.copy_(model_state[name], non_blocking=False)
+        self._backup_ready = True
 
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        model_state = unwrap_model(model).state_dict()
+        shadow_state = self.shadow.state_dict()
+        for name in self._state_names:
+            model_state[name].copy_(shadow_state[name], non_blocking=False)
 
-def maybe_enable_data_parallel(
-    model: nn.Module,
-    *,
-    device: torch.device,
-    runtime_cfg: dict[str, Any],
-    log_prefix: str,
-) -> nn.Module:
-    raw_setting = runtime_cfg.get("data_parallel", "auto")
-    setting = str(raw_setting).strip().lower()
-    disabled_values = {"0", "false", "no", "off", "disabled"}
-    enabled_values = {"1", "true", "yes", "on", "enabled"}
-
-    if setting in disabled_values:
-        return model
-    if setting not in enabled_values and setting != "auto":
-        raise ValueError(f"Unsupported runtime.data_parallel={raw_setting!r}; expected auto/true/false")
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return model
-
-    visible_gpu_count = int(torch.cuda.device_count())
-    if visible_gpu_count <= 1:
-        return model
-
-    primary_device = 0 if device.index is None else int(device.index)
-    if primary_device < 0 or primary_device >= visible_gpu_count:
-        log_progress(
-            f"{log_prefix} skip data_parallel because primary_device={primary_device} is outside "
-            f"visible_gpu_count={visible_gpu_count}"
-        )
-        return model
-
-    device_ids = [primary_device] + [idx for idx in range(visible_gpu_count) if idx != primary_device]
-    model.to(torch.device("cuda", primary_device))
-    log_progress(
-        f"{log_prefix} enable data_parallel visible_gpu_count={visible_gpu_count} "
-        f"device_ids={','.join(str(item) for item in device_ids)}"
-    )
-    return AIFPlusDataParallel(model, device_ids=device_ids, output_device=primary_device)
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if not self._backup_ready:
+            raise RuntimeError("EMA restore called before store")
+        model_state = unwrap_model(model).state_dict()
+        for name in self._state_names:
+            model_state[name].copy_(self._backup_state[name], non_blocking=False)
+        self._backup_ready = False
 
 
 def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
@@ -233,6 +233,18 @@ def load_model_state(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> 
     unwrap_model(module).load_state_dict(state_dict)
 
 
+def append_window_error_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def evaluate_with_ema_state(
     *,
     model: nn.Module,
@@ -250,8 +262,9 @@ def evaluate_with_ema_state(
     horizon_id: int,
     force_intervened_input: bool,
     split_name: str,
-    setting_meta: dict[str, Any],
-) -> tuple[dict[str, float], pd.DataFrame]:
+    setting_meta: dict[str, Any] | None,
+    collect_error_rows: bool = False,
+) -> tuple[dict[str, float], list[dict[str, Any]] | None]:
     if ema is None:
         return evaluate_aif_plus(
             model=model,
@@ -269,9 +282,10 @@ def evaluate_with_ema_state(
             force_intervened_input=force_intervened_input,
             split_name=split_name,
             setting_meta=setting_meta,
+            collect_error_rows=collect_error_rows,
         )
-    live_state = clone_state_dict(model)
-    load_model_state(model, ema.state_dict())
+    ema.store(model)
+    ema.copy_to(model)
     try:
         return evaluate_aif_plus(
             model=model,
@@ -289,9 +303,10 @@ def evaluate_with_ema_state(
             force_intervened_input=force_intervened_input,
             split_name=split_name,
             setting_meta=setting_meta,
+            collect_error_rows=collect_error_rows,
         )
     finally:
-        load_model_state(model, live_state)
+        ema.restore(model)
 
 
 def average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -542,10 +557,11 @@ def evaluate_aif_plus(
     horizon_id: int,
     force_intervened_input: bool,
     split_name: str,
-    setting_meta: dict[str, Any],
-) -> tuple[dict[str, float], pd.DataFrame]:
+    setting_meta: dict[str, Any] | None,
+    collect_error_rows: bool = False,
+) -> tuple[dict[str, float], list[dict[str, Any]] | None]:
     if eval_rows.empty:
-        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, pd.DataFrame()
+        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, ([] if collect_error_rows else None)
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
     pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
@@ -574,7 +590,7 @@ def evaluate_aif_plus(
     total_mse = 0.0
     total_smape = 0.0
     total_count = 0
-    error_rows: list[dict[str, Any]] = []
+    error_rows: list[dict[str, Any]] | None = [] if collect_error_rows else None
 
     with torch.no_grad():
         for batch in loader:
@@ -599,32 +615,34 @@ def evaluate_aif_plus(
             total_smape += float(smape_vec.sum().item())
             total_count += batch_size
 
-            for idx in range(batch_size):
-                error_rows.append(
-                    {
-                        **setting_meta,
-                        "window_id": str(batch["window_id"][idx]),
-                        "group_key": str(batch["group_key"][idx]),
-                        "phase_group": str(batch["phase_group"][idx]),
-                        "artifact_group_major": str(batch["artifact_group_major"][idx]),
-                        "is_flagged": int(batch["flagged_mask"][idx]),
-                        "has_input_intervention": int(batch["has_input_intervention"][idx]),
-                        "strict_target_clean": int(batch["strict_target_clean"][idx]),
-                        "subset_name": str(batch["subset_name"][idx]),
-                        "mae": float(mae_vec[idx].detach().cpu().item()),
-                        "mse": float(mse_vec[idx].detach().cpu().item()),
-                        "smape": float(smape_vec[idx].detach().cpu().item()),
-                    }
-                )
+            if error_rows is not None:
+                error_meta = setting_meta or {}
+                for idx in range(batch_size):
+                    error_rows.append(
+                        {
+                            **error_meta,
+                            "window_id": str(batch["window_id"][idx]),
+                            "group_key": str(batch["group_key"][idx]),
+                            "phase_group": str(batch["phase_group"][idx]),
+                            "artifact_group_major": str(batch["artifact_group_major"][idx]),
+                            "is_flagged": int(batch["flagged_mask"][idx]),
+                            "has_input_intervention": int(batch["has_input_intervention"][idx]),
+                            "strict_target_clean": int(batch["strict_target_clean"][idx]),
+                            "subset_name": str(batch["subset_name"][idx]),
+                            "mae": float(mae_vec[idx].detach().cpu().item()),
+                            "mse": float(mse_vec[idx].detach().cpu().item()),
+                            "smape": float(smape_vec[idx].detach().cpu().item()),
+                        }
+                    )
 
     if total_count == 0:
-        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, pd.DataFrame(error_rows)
+        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, error_rows
     metrics = {
         "mae": float(total_mae / total_count),
         "mse": float(total_mse / total_count),
         "smape": float(total_smape / total_count),
     }
-    return metrics, pd.DataFrame(error_rows)
+    return metrics, error_rows
 
 
 def select_validation_rows(view_df: pd.DataFrame, clean_view_name: str, max_rows: int | None) -> pd.DataFrame:
@@ -762,7 +780,7 @@ def fit_aif_v4(
     )
     grad_clip = float(runtime_cfg.get("grad_clip", 1.0))
     patience = int(runtime_cfg.get("patience", 8))
-    checkpoint_topk = max(1, int(runtime_cfg.get("checkpoint_topk", 5)))
+    checkpoint_topk = max(1, int(runtime_cfg.get("checkpoint_topk", 3)))
     checkpoint_soup_k = max(1, int(runtime_cfg.get("checkpoint_soup_k", 3)))
 
     best_score = float("inf")
@@ -798,6 +816,7 @@ def fit_aif_v4(
                     x_masked=x_masked,
                     uncertainty=uncertainty,
                     horizon_id=horizon_tensor,
+                    return_aux=False,
                 )
                 loss_terms = loss_fn(outputs["pred"], y)
                 loss = loss_terms["loss"]
@@ -1117,13 +1136,24 @@ def main() -> None:
     events_path = ROOT_DIR / Path(args.events)
     support_summary_path = ROOT_DIR / Path(args.support_summary)
     baseline_results_path = ROOT_DIR / Path(args.baseline_results)
+    results_out = ROOT_DIR / Path(args.results_out)
+    window_errors_out = ROOT_DIR / Path(args.window_errors_out)
+    arg_out = ROOT_DIR / Path(args.arg_out)
+    wgr_out = ROOT_DIR / Path(args.wgr_out)
+    ri_out = ROOT_DIR / Path(args.ri_out)
+    report_out = ROOT_DIR / Path(args.report_out)
+    checkpoint_out = ROOT_DIR / Path(args.checkpoint_comparison_out) if args.checkpoint_comparison_out else None
+    output_paths = [results_out, window_errors_out, arg_out, wgr_out, ri_out, report_out]
+    if checkpoint_out is not None:
+        output_paths.append(checkpoint_out)
+    for path in output_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if window_errors_out.exists():
+        window_errors_out.unlink()
     support_vocab = load_support_vocab(support_summary_path)
 
     result_rows: list[dict[str, Any]] = []
-    error_frames: list[pd.DataFrame] = []
     checkpoint_rows: list[dict[str, Any]] = []
-    bundle_cache: dict[str, Any] = {}
-    events_cache: dict[str, dict[str, Any]] = {}
     log_progress(f"start datasets={datasets} horizons={horizons}")
 
     for dataset_name in datasets:
@@ -1133,8 +1163,8 @@ def main() -> None:
         loss_cfg = dict(dataset_cfg["loss"])
         lookback = int(dataset_cfg["lookback"])
         collapse_aux_label_vocabs = bool(dataset_cfg["collapse_aux_label_vocabs"])
-        bundle_cache[dataset_name] = load_dataset_bundle(dataset_name, registry_path=registry_path)
-        events_cache[dataset_name] = load_events_lookup(events_path=events_path, dataset_name=dataset_name)
+        dataset_bundle = load_dataset_bundle(dataset_name, registry_path=registry_path)
+        events_lookup = load_events_lookup(events_path=events_path, dataset_name=dataset_name)
         clean_view_name = resolve_clean_view_name(config, dataset_name)
 
         for horizon in horizons:
@@ -1195,17 +1225,11 @@ def main() -> None:
                         model_cfg=model_cfg,
                         lookback=lookback,
                         horizon=horizon,
-                        n_vars=bundle_cache[dataset_name].n_vars,
+                        n_vars=dataset_bundle.n_vars,
                         horizon_vocab_size=len(horizon_id_map),
                     )
                 )
                 model.to(device)
-                model = maybe_enable_data_parallel(
-                    model,
-                    device=device,
-                    runtime_cfg=runtime_cfg,
-                    log_prefix=log_prefix,
-                )
                 ema = (
                     ModelEMA(
                         model,
@@ -1219,8 +1243,8 @@ def main() -> None:
                 train_loader = build_loader(
                     AIFPlusWindowDataset(
                         rows=train_rows,
-                        dataset_bundle=bundle_cache[dataset_name],
-                        events_lookup=events_cache[dataset_name],
+                        dataset_bundle=dataset_bundle,
+                        events_lookup=events_lookup,
                         clean_view_name=clean_view_name,
                         group_map=group_map,
                         artifact_map=artifact_map,
@@ -1241,8 +1265,8 @@ def main() -> None:
                     ema=ema,
                     train_loader=train_loader,
                     val_rows=val_rows,
-                    dataset_bundle=bundle_cache[dataset_name],
-                    events_lookup=events_cache[dataset_name],
+                    dataset_bundle=dataset_bundle,
+                    events_lookup=events_lookup,
                     clean_view_name=clean_view_name,
                     runtime_cfg=runtime_cfg,
                     loss_cfg=loss_cfg,
@@ -1272,10 +1296,27 @@ def main() -> None:
                         )
                         if eval_rows.empty:
                             continue
+                        collect_error_rows = variant_name == "soup"
+                        error_setting_meta = (
+                            {
+                                "dataset_name": dataset_name,
+                                "backbone": experiment_meta["backbone_name"],
+                                "lookback": lookback,
+                                "horizon": horizon,
+                                "train_view_name": experiment_meta["train_view_name"],
+                                "eval_view_name": eval_view_name,
+                                "checkpoint_variant": variant_name,
+                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                            }
+                            if collect_error_rows
+                            else None
+                        )
                         metrics, errors = evaluate_aif_plus(
                             model=model,
-                            dataset_bundle=bundle_cache[dataset_name],
-                            events_lookup=events_cache[dataset_name],
+                            dataset_bundle=dataset_bundle,
+                            events_lookup=events_lookup,
                             eval_rows=eval_rows,
                             clean_view_name=clean_view_name,
                             runtime_cfg=runtime_cfg,
@@ -1287,18 +1328,8 @@ def main() -> None:
                             horizon_id=horizon_id_map[horizon],
                             force_intervened_input=force_intervened_input,
                             split_name="test",
-                            setting_meta={
-                                "dataset_name": dataset_name,
-                                "backbone": experiment_meta["backbone_name"],
-                                "lookback": lookback,
-                                "horizon": horizon,
-                                "train_view_name": experiment_meta["train_view_name"],
-                                "eval_view_name": eval_view_name,
-                                "checkpoint_variant": variant_name,
-                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                            },
+                            setting_meta=error_setting_meta,
+                            collect_error_rows=collect_error_rows,
                         )
                         checkpoint_rows.append(
                             {
@@ -1352,32 +1383,32 @@ def main() -> None:
                                     "smape": round(float(metrics["smape"]), 6),
                                 }
                             )
-                            error_frames.append(errors)
+                            append_window_error_rows(window_errors_out, errors or [])
                         log_progress(
                             f"done dataset={dataset_name} L{lookback} H{horizon} seed={seed} "
                             f"variant={variant_name} view={eval_view_name} mae={float(metrics['mae']):.6f}"
                         )
+                del train_info
+                del train_loader
+                del ema
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        del events_lookup
+        del dataset_bundle
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     results_df = sort_results_frame(pd.DataFrame(result_rows))
-    window_errors_df = sort_window_errors_frame(pd.concat(error_frames, ignore_index=True) if error_frames else pd.DataFrame())
+    window_errors_df = sort_window_errors_frame(
+        pd.read_csv(window_errors_out, low_memory=False) if window_errors_out.exists() else pd.DataFrame()
+    )
     checkpoint_df = sort_results_frame(pd.DataFrame(checkpoint_rows))
     arg_df = compute_aif_arg_table(results_df)
     wgr_df = compute_aif_wgr_table(window_errors_df)
     ri_df = compute_aif_ri_table(results_df)
-
-    results_out = ROOT_DIR / Path(args.results_out)
-    window_errors_out = ROOT_DIR / Path(args.window_errors_out)
-    arg_out = ROOT_DIR / Path(args.arg_out)
-    wgr_out = ROOT_DIR / Path(args.wgr_out)
-    ri_out = ROOT_DIR / Path(args.ri_out)
-    report_out = ROOT_DIR / Path(args.report_out)
-    checkpoint_out = ROOT_DIR / Path(args.checkpoint_comparison_out) if args.checkpoint_comparison_out else None
-
-    output_paths = [results_out, window_errors_out, arg_out, wgr_out, ri_out, report_out]
-    if checkpoint_out is not None:
-        output_paths.append(checkpoint_out)
-    for path in output_paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
 
     results_df.to_csv(results_out, index=False)
     window_errors_df.to_csv(window_errors_out, index=False)
