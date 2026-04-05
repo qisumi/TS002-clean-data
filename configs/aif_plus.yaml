@@ -47,6 +47,8 @@ defaults:
     spectral_topk: 8
     residual_hidden: 16
     lambda_res_max: 0.01
+    activation_checkpointing: true
+    bc_chunk_size: 1024
   runtime:
     device: auto
     batch_size: 128
@@ -62,6 +64,7 @@ defaults:
     patience: 10
     use_ema: true
     ema_decay: 0.999
+    ema_device: cpu
     checkpoint_topk: 5
     checkpoint_soup_k: 3
     max_train_windows: 12000

@@ -98,18 +98,31 @@ class CheckpointSnapshot:
 
 
 class ModelEMA:
-    def __init__(self, model: nn.Module, decay: float) -> None:
+    def __init__(self, model: nn.Module, decay: float, device: str = "same") -> None:
         self.decay = float(decay)
-        self.shadow = copy.deepcopy(model).eval()
+        base_model = unwrap_model(model)
+        if hasattr(base_model, "config"):
+            self.shadow = type(base_model)(base_model.config).eval()
+            self.shadow.load_state_dict(clone_tensor_state_dict(base_model.state_dict()))
+        else:
+            self.shadow = copy.deepcopy(base_model).eval()
+        target_device = str(device).strip().lower()
+        if target_device in {"", "same", "model"}:
+            shadow_device = next(base_model.parameters()).device
+        else:
+            shadow_device = torch.device(target_device)
+        self.shadow.to(shadow_device)
         for param in self.shadow.parameters():
             param.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        model_state = model.state_dict()
+        model_state = unwrap_model(model).state_dict()
         shadow_state = self.shadow.state_dict()
         for name, value in shadow_state.items():
             source = model_state[name].detach()
+            if source.device != value.device:
+                source = source.to(device=value.device)
             if not torch.is_floating_point(source):
                 value.copy_(source)
                 continue
@@ -204,8 +217,81 @@ def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_r
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def unwrap_model(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, nn.DataParallel) else module
+
+
+def clone_tensor_state_dict(state_dict: dict[str, torch.Tensor] | dict[str, Any]) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
+
+
 def clone_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
-    return {name: tensor.detach().cpu().clone() for name, tensor in module.state_dict().items()}
+    return clone_tensor_state_dict(unwrap_model(module).state_dict())
+
+
+def load_model_state(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    unwrap_model(module).load_state_dict(state_dict)
+
+
+def evaluate_with_ema_state(
+    *,
+    model: nn.Module,
+    ema: ModelEMA | None,
+    dataset_bundle: Any,
+    events_lookup: dict[str, dict[str, Any]],
+    eval_rows: pd.DataFrame,
+    clean_view_name: str,
+    runtime_cfg: dict[str, Any],
+    metadata_context: dict[str, Any],
+    group_map: dict[str, int],
+    artifact_map: dict[str, int],
+    phase_map: dict[str, int],
+    support_id_lookup: dict[str, int],
+    horizon_id: int,
+    force_intervened_input: bool,
+    split_name: str,
+    setting_meta: dict[str, Any],
+) -> tuple[dict[str, float], pd.DataFrame]:
+    if ema is None:
+        return evaluate_aif_plus(
+            model=model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=eval_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=force_intervened_input,
+            split_name=split_name,
+            setting_meta=setting_meta,
+        )
+    live_state = clone_state_dict(model)
+    load_model_state(model, ema.state_dict())
+    try:
+        return evaluate_aif_plus(
+            model=model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=eval_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=force_intervened_input,
+            split_name=split_name,
+            setting_meta=setting_meta,
+        )
+    finally:
+        load_model_state(model, live_state)
 
 
 def average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -496,18 +582,12 @@ def evaluate_aif_plus(
             x_masked = batch["x_masked"].to(device, non_blocking=True)
             uncertainty = batch["uncertainty"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
-            metadata_num = batch["metadata_num"].to(device, non_blocking=True)
-            dataset_id = batch["dataset_id"].to(device, non_blocking=True)
-            support_id = batch["support_id"].to(device, non_blocking=True)
             horizon_id_tensor = batch["horizon_id"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
                 pred = model.predict(
                     x_raw=x_raw,
                     x_masked=x_masked,
                     uncertainty=uncertainty,
-                    metadata_num=metadata_num,
-                    dataset_id=dataset_id,
-                    support_id=support_id,
                     horizon_id=horizon_id_tensor,
                 )
             mae_vec = (pred - y).abs().mean(dim=(1, 2))
@@ -632,6 +712,8 @@ def build_model_config(
         spectral_topk=int(model_cfg.get("spectral_topk", 8)),
         residual_hidden=int(model_cfg.get("residual_hidden", model_cfg.get("resid_hidden", 32))),
         lambda_res_max=float(model_cfg.get("lambda_res_max", model_cfg.get("lambda_res_init", 0.03))),
+        activation_checkpointing=bool(model_cfg.get("activation_checkpointing", True)),
+        bc_chunk_size=max(int(model_cfg.get("bc_chunk_size", 1024) or 0), 0),
     )
 
 
@@ -707,9 +789,6 @@ def fit_aif_v4(
             x_masked = batch["x_masked"].to(device, non_blocking=True)
             uncertainty = batch["uncertainty"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
-            metadata_num = batch["metadata_num"].to(device, non_blocking=True)
-            dataset_id = batch["dataset_id"].to(device, non_blocking=True)
-            support_id = batch["support_id"].to(device, non_blocking=True)
             horizon_tensor = batch["horizon_id"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
@@ -718,9 +797,6 @@ def fit_aif_v4(
                     x_raw=x_raw,
                     x_masked=x_masked,
                     uncertainty=uncertainty,
-                    metadata_num=metadata_num,
-                    dataset_id=dataset_id,
-                    support_id=support_id,
                     horizon_id=horizon_tensor,
                 )
                 loss_terms = loss_fn(outputs["pred"], y)
@@ -741,9 +817,9 @@ def fit_aif_v4(
             train_mse_sum += float(loss_terms["mse"].detach().cpu().item())
             train_batches += 1
 
-        eval_model = ema.shadow if ema is not None else model
-        val_metrics, _ = evaluate_aif_plus(
-            model=eval_model,
+        val_metrics, _ = evaluate_with_ema_state(
+            model=model,
+            ema=ema,
             dataset_bundle=dataset_bundle,
             events_lookup=events_lookup,
             eval_rows=val_rows,
@@ -796,7 +872,7 @@ def fit_aif_v4(
                     val_mae=current_val_mae,
                     val_mse=current_val_mse,
                     val_score=current_val_score,
-                    state=clone_state_dict(eval_model),
+                    state=clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model),
                 )
             )
             top_checkpoints.sort(key=snapshot_sort_key)
@@ -820,9 +896,9 @@ def fit_aif_v4(
                 break
 
     if not top_checkpoints:
-        final_model = ema.shadow if ema is not None else model
-        val_metrics, _ = evaluate_aif_plus(
-            model=final_model,
+        val_metrics, _ = evaluate_with_ema_state(
+            model=model,
+            ema=ema,
             dataset_bundle=dataset_bundle,
             events_lookup=events_lookup,
             eval_rows=val_rows,
@@ -844,14 +920,14 @@ def fit_aif_v4(
                 val_mae=float(val_metrics["mae"]),
                 val_mse=float(val_metrics["mse"]),
                 val_score=compute_val_score(val_metrics),
-                state=clone_state_dict(final_model),
+                state=clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model),
             )
         )
 
     top_checkpoints.sort(key=snapshot_sort_key)
     best_single = top_checkpoints[0]
     soup_sources = top_checkpoints[: min(checkpoint_soup_k, len(top_checkpoints))]
-    ema_state = clone_state_dict(ema.shadow if ema is not None else model)
+    ema_state = clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model)
     variants: dict[str, dict[str, Any]] = {
         "best_single": {
             "state": best_single.state,
@@ -868,7 +944,7 @@ def fit_aif_v4(
     }
 
     for variant_name, payload in variants.items():
-        model.load_state_dict(payload["state"])
+        load_model_state(model, payload["state"])
         variant_metrics, _ = evaluate_aif_plus(
             model=model,
             dataset_bundle=dataset_bundle,
@@ -894,7 +970,7 @@ def fit_aif_v4(
             f"val_score={payload['val_score']:.6f} source_epochs={','.join(str(item) for item in payload['source_epochs'])}"
         )
 
-    model.load_state_dict(variants["soup"]["state"])
+    load_model_state(model, variants["soup"]["state"])
     if ema is not None:
         ema.load_state_dict(variants["soup"]["state"])
 
@@ -1130,7 +1206,15 @@ def main() -> None:
                     runtime_cfg=runtime_cfg,
                     log_prefix=log_prefix,
                 )
-                ema = ModelEMA(model, decay=float(runtime_cfg.get("ema_decay", 0.999))) if bool(runtime_cfg.get("use_ema", True)) else None
+                ema = (
+                    ModelEMA(
+                        model,
+                        decay=float(runtime_cfg.get("ema_decay", 0.999)),
+                        device=str(runtime_cfg.get("ema_device", "same")),
+                    )
+                    if bool(runtime_cfg.get("use_ema", True))
+                    else None
+                )
                 pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
                 train_loader = build_loader(
                     AIFPlusWindowDataset(
@@ -1173,7 +1257,7 @@ def main() -> None:
                 )
 
                 for variant_name, variant_payload in train_info["variants"].items():
-                    model.load_state_dict(variant_payload["state"])
+                    load_model_state(model, variant_payload["state"])
                     source_epochs_text = ",".join(str(item) for item in variant_payload["source_epochs"])
                     for eval_view_name, force_intervened_input in [
                         ("raw", False),
