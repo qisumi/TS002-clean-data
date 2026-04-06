@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import gc
 import importlib.util
 import math
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -89,113 +88,31 @@ METADATA_NUMERIC_COLUMNS = [
     "soft_mask_mean",
 ]
 
+WINDOW_ERROR_MINIMAL_FIELDS = [
+    "dataset_name",
+    "backbone",
+    "lookback",
+    "horizon",
+    "train_view_name",
+    "eval_view_name",
+    "seed",
+    "checkpoint_variant",
+    "window_id",
+    "group_key",
+    "mae",
+    "mse",
+    "smape",
+    "is_valid_metric",
+    "has_input_intervention",
+    "strict_target_clean",
+]
 
-@dataclass
-class CheckpointSnapshot:
-    epoch: int
-    val_mae: float
-    val_mse: float
-    val_score: float
-    state: dict[str, torch.Tensor]
-
-
-class ModelEMA:
-    def __init__(self, model: nn.Module, decay: float, device: str = "same") -> None:
-        self.decay = float(decay)
-        base_model = unwrap_model(model)
-        if hasattr(base_model, "config"):
-            self.shadow = type(base_model)(base_model.config).eval()
-            self.shadow.load_state_dict(clone_tensor_state_dict(base_model.state_dict()))
-        else:
-            self.shadow = copy.deepcopy(base_model).eval()
-        target_device = str(device).strip().lower()
-        if target_device in {"", "same", "model"}:
-            shadow_device = next(base_model.parameters()).device
-        else:
-            shadow_device = torch.device(target_device)
-        self._shadow_device = shadow_device
-        self.shadow.to(shadow_device)
-        for param in self.shadow.parameters():
-            param.requires_grad_(False)
-        self._state_names = tuple(self.shadow.state_dict().keys())
-        self._update_scratch_state: dict[str, torch.Tensor] = {}
-        self._backup_state: dict[str, torch.Tensor] = (
-            self._update_scratch_state if self._shadow_device.type == "cpu" else {}
-        )
-        self._backup_ready = False
-
-    @staticmethod
-    def _ensure_tensor_slot(
-        storage: dict[str, torch.Tensor],
-        name: str,
-        reference: torch.Tensor,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        scratch = storage.get(name)
-        if scratch is None or scratch.shape != reference.shape or scratch.dtype != reference.dtype or scratch.device != device:
-            scratch = torch.empty_like(reference, device=device)
-            storage[name] = scratch
-        return scratch
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        if self._backup_ready:
-            raise RuntimeError("EMA update called while a live model backup is still active")
-        model_state = unwrap_model(model).state_dict()
-        shadow_state = self.shadow.state_dict()
-        for name in self._state_names:
-            value = shadow_state[name]
-            source = model_state[name].detach()
-            if source.device != value.device:
-                source_cpu = self._ensure_tensor_slot(
-                    self._update_scratch_state,
-                    name,
-                    value,
-                    device=value.device,
-                )
-                source_cpu.copy_(source, non_blocking=False)
-                source = source_cpu
-            if not torch.is_floating_point(source):
-                value.copy_(source)
-                continue
-            value.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.shadow.state_dict()
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.shadow.load_state_dict(state_dict)
-
-    @torch.no_grad()
-    def store(self, model: nn.Module) -> None:
-        model_state = unwrap_model(model).state_dict()
-        shadow_state = self.shadow.state_dict()
-        for name in self._state_names:
-            backup = self._ensure_tensor_slot(
-                self._backup_state,
-                name,
-                shadow_state[name],
-                device=torch.device("cpu"),
-            )
-            backup.copy_(model_state[name], non_blocking=False)
-        self._backup_ready = True
-
-    @torch.no_grad()
-    def copy_to(self, model: nn.Module) -> None:
-        model_state = unwrap_model(model).state_dict()
-        shadow_state = self.shadow.state_dict()
-        for name in self._state_names:
-            model_state[name].copy_(shadow_state[name], non_blocking=False)
-
-    @torch.no_grad()
-    def restore(self, model: nn.Module) -> None:
-        if not self._backup_ready:
-            raise RuntimeError("EMA restore called before store")
-        model_state = unwrap_model(model).state_dict()
-        for name in self._state_names:
-            model_state[name].copy_(self._backup_state[name], non_blocking=False)
-        self._backup_ready = False
+WINDOW_ERROR_RICH_FIELDS = [
+    "phase_group",
+    "artifact_group_major",
+    "is_flagged",
+    "subset_name",
+]
 
 
 def parse_optimizer_betas(runtime_cfg: dict[str, Any]) -> tuple[float, float]:
@@ -233,120 +150,76 @@ def load_model_state(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> 
     unwrap_model(module).load_state_dict(state_dict)
 
 
-def append_window_error_rows(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists() or path.stat().st_size == 0
-    with path.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
+class WindowErrorCSVWriter:
+    def __init__(self, path: Path, *, rich_fields: bool = False) -> None:
+        self.path = path
+        self.fieldnames = list(WINDOW_ERROR_MINIMAL_FIELDS)
+        if rich_fields:
+            self.fieldnames.extend(WINDOW_ERROR_RICH_FIELDS)
+        self._handle: Any | None = None
+        self._writer: csv.DictWriter | None = None
+        self._header_written = self.path.exists() and self.path.stat().st_size > 0
 
+    def __enter__(self) -> WindowErrorCSVWriter:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._handle, fieldnames=self.fieldnames)
+        if not self._header_written:
+            self._writer.writeheader()
+            self._header_written = True
+        return self
 
-def evaluate_with_ema_state(
-    *,
-    model: nn.Module,
-    ema: ModelEMA | None,
-    dataset_bundle: Any,
-    events_lookup: dict[str, dict[str, Any]],
-    eval_rows: pd.DataFrame,
-    clean_view_name: str,
-    runtime_cfg: dict[str, Any],
-    metadata_context: dict[str, Any],
-    group_map: dict[str, int],
-    artifact_map: dict[str, int],
-    phase_map: dict[str, int],
-    support_id_lookup: dict[str, int],
-    horizon_id: int,
-    force_intervened_input: bool,
-    split_name: str,
-    setting_meta: dict[str, Any] | None,
-    collect_error_rows: bool = False,
-) -> tuple[dict[str, float], list[dict[str, Any]] | None]:
-    if ema is None:
-        return evaluate_aif_plus(
-            model=model,
-            dataset_bundle=dataset_bundle,
-            events_lookup=events_lookup,
-            eval_rows=eval_rows,
-            clean_view_name=clean_view_name,
-            runtime_cfg=runtime_cfg,
-            metadata_context=metadata_context,
-            group_map=group_map,
-            artifact_map=artifact_map,
-            phase_map=phase_map,
-            support_id_lookup=support_id_lookup,
-            horizon_id=horizon_id,
-            force_intervened_input=force_intervened_input,
-            split_name=split_name,
-            setting_meta=setting_meta,
-            collect_error_rows=collect_error_rows,
-        )
-    ema.store(model)
-    ema.copy_to(model)
-    try:
-        return evaluate_aif_plus(
-            model=model,
-            dataset_bundle=dataset_bundle,
-            events_lookup=events_lookup,
-            eval_rows=eval_rows,
-            clean_view_name=clean_view_name,
-            runtime_cfg=runtime_cfg,
-            metadata_context=metadata_context,
-            group_map=group_map,
-            artifact_map=artifact_map,
-            phase_map=phase_map,
-            support_id_lookup=support_id_lookup,
-            horizon_id=horizon_id,
-            force_intervened_input=force_intervened_input,
-            split_name=split_name,
-            setting_meta=setting_meta,
-            collect_error_rows=collect_error_rows,
-        )
-    finally:
-        ema.restore(model)
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = None
+        self._writer = None
 
-
-def average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    if not states:
-        raise ValueError("average_state_dicts requires at least one state dict")
-    averaged: dict[str, torch.Tensor] = {}
-    for name in states[0]:
-        first = states[0][name]
-        if not torch.is_floating_point(first):
-            averaged[name] = first.clone()
-            continue
-        stacked = torch.stack([state[name].to(dtype=torch.float32) for state in states], dim=0)
-        averaged[name] = stacked.mean(dim=0).to(dtype=first.dtype)
-    return averaged
+    def write_rows(self, rows: list[dict[str, Any]]) -> None:
+        if not rows or self._writer is None:
+            return
+        self._writer.writerows(rows)
 
 
 def compute_val_score(metrics: dict[str, float]) -> float:
     return 0.6 * float(metrics["mae"]) + 0.4 * float(metrics["mse"])
 
 
-def snapshot_sort_key(snapshot: CheckpointSnapshot) -> tuple[float, float, float, int]:
-    return (snapshot.val_score, snapshot.val_mae, snapshot.val_mse, snapshot.epoch)
+def parse_bool_arg(value: str | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"", "1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got `{value}`")
 
 
-def metrics_improved(
-    *,
-    score: float,
-    mae: float,
-    mse: float,
-    best_score: float,
-    best_mae: float,
-    best_mse: float,
-) -> bool:
-    if score + 1e-9 < best_score:
-        return True
-    if abs(score - best_score) <= 1e-9 and mae + 1e-9 < best_mae:
-        return True
-    if abs(score - best_score) <= 1e-9 and abs(mae - best_mae) <= 1e-9 and mse + 1e-9 < best_mse:
-        return True
-    return False
+def parse_csv_values(raw_value: str | None) -> list[str]:
+    if raw_value is None:
+        return []
+    return [item.strip() for item in str(raw_value).split(",") if item.strip()]
+
+
+def resolve_cli_subset(raw_value: str | None, caster: Any) -> list[Any] | None:
+    items = parse_csv_values(raw_value)
+    if not items:
+        return None
+    return [caster(item) for item in items]
+
+
+def with_run_tag(path_text: str, default_path: str, run_tag: str) -> str:
+    if not run_tag or path_text != default_path:
+        return path_text
+    path = Path(path_text)
+    return str(path.with_name(f"{path.stem}.{run_tag}{path.suffix}"))
+
+
+def resolve_checkpoint_sort_key(mae: float, mse: float, epoch: int) -> tuple[float, float, int]:
+    mae_rank = float(mae) if math.isfinite(mae) else float("inf")
+    mse_rank = float(mse) if math.isfinite(mse) else float("inf")
+    return (mae_rank, mse_rank, int(epoch))
 
 
 class AIFPlusWindowDataset(Dataset[dict[str, Any]]):
@@ -523,6 +396,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wgr-out", default=str(Path("results") / "aif_plus_worst_group_risk.csv"))
     parser.add_argument("--ri-out", default=str(Path("results") / "aif_plus_ranking_instability.csv"))
     parser.add_argument("--report-out", default=str(Path("reports") / "aif_plus_summary.md"))
+    parser.add_argument("--datasets", default="")
+    parser.add_argument("--horizons", default="")
+    parser.add_argument("--seeds", default="")
+    parser.add_argument("--run-tag", default="")
+    parser.add_argument("--write-window-errors", type=parse_bool_arg, default=True)
+    parser.add_argument("--window-error-rich-fields", type=parse_bool_arg, default=False)
+    parser.add_argument("--debug-write-val-window-errors", type=parse_bool_arg, default=False)
     parser.add_argument("--checkpoint-comparison-out", default="")
     return parser.parse_args()
 
@@ -558,10 +438,21 @@ def evaluate_aif_plus(
     force_intervened_input: bool,
     split_name: str,
     setting_meta: dict[str, Any] | None,
-    collect_error_rows: bool = False,
-) -> tuple[dict[str, float], list[dict[str, Any]] | None]:
+    *,
+    window_error_path: Path | None = None,
+    write_window_errors: bool = False,
+    window_error_rich_fields: bool = False,
+) -> dict[str, float]:
     if eval_rows.empty:
-        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, ([] if collect_error_rows else None)
+        return {
+            "mae": float("nan"),
+            "mse": float("nan"),
+            "smape": float("nan"),
+            "n_total_windows": 0,
+            "n_valid_windows": 0,
+            "n_invalid_windows": 0,
+            "invalid_ratio": float("nan"),
+        }
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
     pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
@@ -589,60 +480,102 @@ def evaluate_aif_plus(
     total_mae = 0.0
     total_mse = 0.0
     total_smape = 0.0
-    total_count = 0
-    error_rows: list[dict[str, Any]] | None = [] if collect_error_rows else None
+    total_windows = 0
+    total_valid_windows = 0
+    total_invalid_windows = 0
+    writer: WindowErrorCSVWriter | None = None
+    if write_window_errors and window_error_path is not None:
+        writer = WindowErrorCSVWriter(window_error_path, rich_fields=window_error_rich_fields)
 
-    with torch.no_grad():
-        for batch in loader:
-            x_raw = batch["x_raw"].to(device, non_blocking=True)
-            x_masked = batch["x_masked"].to(device, non_blocking=True)
-            uncertainty = batch["uncertainty"].to(device, non_blocking=True)
-            y = batch["y"].to(device, non_blocking=True)
-            horizon_id_tensor = batch["horizon_id"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                pred = model.predict(
-                    x_raw=x_raw,
-                    x_masked=x_masked,
-                    uncertainty=uncertainty,
-                    horizon_id=horizon_id_tensor,
-                )
-            mae_vec = (pred - y).abs().mean(dim=(1, 2))
-            mse_vec = ((pred - y) ** 2).mean(dim=(1, 2))
-            smape_vec = (200.0 * (pred - y).abs() / (pred.abs() + y.abs() + 1e-6)).mean(dim=(1, 2))
-            batch_size = int(x_raw.shape[0])
-            total_mae += float(mae_vec.sum().item())
-            total_mse += float(mse_vec.sum().item())
-            total_smape += float(smape_vec.sum().item())
-            total_count += batch_size
+    try:
+        with (writer or nullcontext()) as active_writer:
+            with torch.no_grad():
+                for batch in loader:
+                    x_raw = batch["x_raw"].to(device, non_blocking=True)
+                    x_masked = batch["x_masked"].to(device, non_blocking=True)
+                    uncertainty = batch["uncertainty"].to(device, non_blocking=True)
+                    y = batch["y"].to(device, non_blocking=True)
+                    horizon_id_tensor = batch["horizon_id"].to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                        pred = model.predict(
+                            x_raw=x_raw,
+                            x_masked=x_masked,
+                            uncertainty=uncertainty,
+                            horizon_id=horizon_id_tensor,
+                        )
+                    mae_vec = (pred - y).abs().mean(dim=(1, 2))
+                    mse_vec = ((pred - y) ** 2).mean(dim=(1, 2))
+                    smape_vec = (200.0 * (pred - y).abs() / (pred.abs() + y.abs() + 1e-6)).mean(dim=(1, 2))
+                    valid_mask = torch.isfinite(mae_vec) & torch.isfinite(mse_vec) & torch.isfinite(smape_vec)
+                    batch_size = int(x_raw.shape[0])
+                    batch_valid = int(valid_mask.sum().item())
+                    batch_invalid = batch_size - batch_valid
+                    total_windows += batch_size
+                    total_valid_windows += batch_valid
+                    total_invalid_windows += batch_invalid
 
-            if error_rows is not None:
-                error_meta = setting_meta or {}
-                for idx in range(batch_size):
-                    error_rows.append(
-                        {
-                            **error_meta,
-                            "window_id": str(batch["window_id"][idx]),
-                            "group_key": str(batch["group_key"][idx]),
-                            "phase_group": str(batch["phase_group"][idx]),
-                            "artifact_group_major": str(batch["artifact_group_major"][idx]),
-                            "is_flagged": int(batch["flagged_mask"][idx]),
-                            "has_input_intervention": int(batch["has_input_intervention"][idx]),
-                            "strict_target_clean": int(batch["strict_target_clean"][idx]),
-                            "subset_name": str(batch["subset_name"][idx]),
-                            "mae": float(mae_vec[idx].detach().cpu().item()),
-                            "mse": float(mse_vec[idx].detach().cpu().item()),
-                            "smape": float(smape_vec[idx].detach().cpu().item()),
-                        }
-                    )
+                    if batch_valid > 0:
+                        total_mae += float(mae_vec[valid_mask].sum().item())
+                        total_mse += float(mse_vec[valid_mask].sum().item())
+                        total_smape += float(smape_vec[valid_mask].sum().item())
 
-    if total_count == 0:
-        return {"mae": float("nan"), "mse": float("nan"), "smape": float("nan")}, error_rows
-    metrics = {
-        "mae": float(total_mae / total_count),
-        "mse": float(total_mse / total_count),
-        "smape": float(total_smape / total_count),
+                    if active_writer is not None:
+                        mae_cpu = mae_vec.detach().cpu().tolist()
+                        mse_cpu = mse_vec.detach().cpu().tolist()
+                        smape_cpu = smape_vec.detach().cpu().tolist()
+                        valid_cpu = valid_mask.detach().cpu().tolist()
+                        error_meta = dict(setting_meta or {})
+                        batch_rows: list[dict[str, Any]] = []
+                        for idx in range(batch_size):
+                            row = {
+                                **error_meta,
+                                "window_id": str(batch["window_id"][idx]),
+                                "group_key": str(batch["group_key"][idx]),
+                                "mae": float(mae_cpu[idx]),
+                                "mse": float(mse_cpu[idx]),
+                                "smape": float(smape_cpu[idx]),
+                                "is_valid_metric": int(bool(valid_cpu[idx])),
+                                "has_input_intervention": int(batch["has_input_intervention"][idx]),
+                                "strict_target_clean": int(batch["strict_target_clean"][idx]),
+                            }
+                            if window_error_rich_fields:
+                                row.update(
+                                    {
+                                        "phase_group": str(batch["phase_group"][idx]),
+                                        "artifact_group_major": str(batch["artifact_group_major"][idx]),
+                                        "is_flagged": int(batch["flagged_mask"][idx]),
+                                        "subset_name": str(batch["subset_name"][idx]),
+                                    }
+                                )
+                            batch_rows.append(row)
+                        active_writer.write_rows(batch_rows)
+    finally:
+        del writer
+
+    invalid_ratio = (
+        float(total_invalid_windows) / float(total_windows)
+        if total_windows > 0
+        else float("nan")
+    )
+    if total_valid_windows <= 0:
+        return {
+            "mae": float("nan"),
+            "mse": float("nan"),
+            "smape": float("nan"),
+            "n_total_windows": int(total_windows),
+            "n_valid_windows": 0,
+            "n_invalid_windows": int(total_invalid_windows),
+            "invalid_ratio": invalid_ratio,
+        }
+    return {
+        "mae": float(total_mae / total_valid_windows),
+        "mse": float(total_mse / total_valid_windows),
+        "smape": float(total_smape / total_valid_windows),
+        "n_total_windows": int(total_windows),
+        "n_valid_windows": int(total_valid_windows),
+        "n_invalid_windows": int(total_invalid_windows),
+        "invalid_ratio": invalid_ratio,
     }
-    return metrics, error_rows
 
 
 def select_validation_rows(view_df: pd.DataFrame, clean_view_name: str, max_rows: int | None) -> pd.DataFrame:
@@ -735,10 +668,9 @@ def build_model_config(
     )
 
 
-def fit_aif_v4(
+def fit_aif_plus_best_single(
     *,
     model: nn.Module,
-    ema: ModelEMA | None,
     train_loader: DataLoader[Any],
     val_rows: pd.DataFrame,
     dataset_bundle: Any,
@@ -754,10 +686,13 @@ def fit_aif_v4(
     horizon_id: int,
     seed: int,
     log_prefix: str,
+    val_window_error_path: Path | None = None,
+    window_error_rich_fields: bool = False,
+    val_setting_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     epochs = int(runtime_cfg.get("epochs", 35))
     if epochs <= 0 or len(train_loader.dataset) == 0:
-        raise ValueError("AIF-Plus v4 training requires positive epochs and non-empty train dataset")
+        raise ValueError("AIF-Plus training requires positive epochs and non-empty train dataset")
 
     device = next(model.parameters()).device
     amp_enabled = bool(runtime_cfg.get("amp", True)) and device.type == "cuda"
@@ -780,19 +715,28 @@ def fit_aif_v4(
     )
     grad_clip = float(runtime_cfg.get("grad_clip", 1.0))
     patience = int(runtime_cfg.get("patience", 8))
-    checkpoint_topk = max(1, int(runtime_cfg.get("checkpoint_topk", 3)))
-    checkpoint_soup_k = max(1, int(runtime_cfg.get("checkpoint_soup_k", 3)))
 
-    best_score = float("inf")
-    best_mae = float("inf")
-    best_mse = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    best_epoch = 0
+    best_val_metrics = {
+        "mae": float("nan"),
+        "mse": float("nan"),
+        "smape": float("nan"),
+        "n_total_windows": 0,
+        "n_valid_windows": 0,
+        "n_invalid_windows": 0,
+        "invalid_ratio": float("nan"),
+    }
+    best_val_score = float("nan")
+    fallback_state: dict[str, torch.Tensor] | None = None
+    fallback_epoch = 0
+    fallback_metrics = dict(best_val_metrics)
     epochs_ran = 0
     patience_counter = 0
-    top_checkpoints: list[CheckpointSnapshot] = []
     set_random_seed(seed)
     log_progress(
         f"{log_prefix} fit start epochs={epochs} lr={float(runtime_cfg.get('lr', 2e-4)):.2e} "
-        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)} topk={checkpoint_topk} soup_k={checkpoint_soup_k}"
+        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)} checkpoint=best_single"
     )
 
     for epoch in range(1, epochs + 1):
@@ -828,17 +772,14 @@ def fit_aif_v4(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            if ema is not None:
-                ema.update(model)
 
             train_loss_sum += float(loss.detach().cpu().item())
             train_mae_sum += float(loss_terms["mae"].detach().cpu().item())
             train_mse_sum += float(loss_terms["mse"].detach().cpu().item())
             train_batches += 1
 
-        val_metrics, _ = evaluate_with_ema_state(
+        val_metrics = evaluate_aif_plus(
             model=model,
-            ema=ema,
             dataset_bundle=dataset_bundle,
             events_lookup=events_lookup,
             eval_rows=val_rows,
@@ -852,159 +793,76 @@ def fit_aif_v4(
             horizon_id=horizon_id,
             force_intervened_input=False,
             split_name="val",
-            setting_meta={},
+            setting_meta=val_setting_meta,
+            window_error_path=val_window_error_path,
+            write_window_errors=val_window_error_path is not None,
+            window_error_rich_fields=window_error_rich_fields,
         )
         current_val_mae = float(val_metrics["mae"])
         current_val_mse = float(val_metrics["mse"])
-        current_val_score = compute_val_score(val_metrics)
+        current_val_score = compute_val_score(val_metrics) if math.isfinite(current_val_mae) and math.isfinite(current_val_mse) else float("nan")
         epochs_ran = epoch
 
+        if fallback_state is None:
+            fallback_state = clone_state_dict(model)
+            fallback_epoch = epoch
+            fallback_metrics = dict(val_metrics)
+
+        best_score_log = (
+            best_val_score
+            if math.isfinite(best_val_score)
+            else current_val_score
+        )
         log_progress(
             f"{log_prefix} epoch {epoch}/{epochs} train_loss={train_loss_sum / max(train_batches, 1):.6f} "
             f"train_mae={train_mae_sum / max(train_batches, 1):.6f} train_mse={train_mse_sum / max(train_batches, 1):.6f} "
             f"val_mae={current_val_mae:.6f} val_mse={current_val_mse:.6f} val_score={current_val_score:.6f} "
-            f"best_score={min(best_score, current_val_score):.6f}"
+            f"val_valid={int(val_metrics['n_valid_windows'])}/{int(val_metrics['n_total_windows'])} "
+            f"invalid_ratio={float(val_metrics['invalid_ratio']):.4f} best_score={best_score_log:.6f}"
         )
 
-        if not math.isfinite(current_val_score):
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
-            continue
-
-        worst_snapshot = top_checkpoints[-1] if top_checkpoints else None
-        should_store = len(top_checkpoints) < checkpoint_topk
-        if not should_store and worst_snapshot is not None:
-            should_store = snapshot_sort_key(
-                CheckpointSnapshot(
-                    epoch=epoch,
-                    val_mae=current_val_mae,
-                    val_mse=current_val_mse,
-                    val_score=current_val_score,
-                    state={},
-                )
-            ) < snapshot_sort_key(worst_snapshot)
-        if should_store:
-            top_checkpoints.append(
-                CheckpointSnapshot(
-                    epoch=epoch,
-                    val_mae=current_val_mae,
-                    val_mse=current_val_mse,
-                    val_score=current_val_score,
-                    state=clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model),
-                )
+        is_finite_candidate = math.isfinite(current_val_mae) and math.isfinite(current_val_mse)
+        if is_finite_candidate:
+            current_key = resolve_checkpoint_sort_key(current_val_mae, current_val_mse, epoch)
+            best_key = resolve_checkpoint_sort_key(
+                float(best_val_metrics["mae"]),
+                float(best_val_metrics["mse"]),
+                best_epoch if best_epoch > 0 else 10**9,
             )
-            top_checkpoints.sort(key=snapshot_sort_key)
-            del top_checkpoints[checkpoint_topk:]
+            if best_state is None or current_key < best_key:
+                best_state = clone_state_dict(model)
+                best_epoch = epoch
+                best_val_metrics = dict(val_metrics)
+                best_val_score = current_val_score
+                patience_counter = 0
+                continue
 
-        if metrics_improved(
-            score=current_val_score,
-            mae=current_val_mae,
-            mse=current_val_mse,
-            best_score=best_score,
-            best_mae=best_mae,
-            best_mse=best_mse,
-        ):
-            best_score = current_val_score
-            best_mae = current_val_mae
-            best_mse = current_val_mse
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
+        patience_counter += 1
+        if patience_counter >= patience:
+            break
 
-    if not top_checkpoints:
-        val_metrics, _ = evaluate_with_ema_state(
-            model=model,
-            ema=ema,
-            dataset_bundle=dataset_bundle,
-            events_lookup=events_lookup,
-            eval_rows=val_rows,
-            clean_view_name=clean_view_name,
-            runtime_cfg=runtime_cfg,
-            metadata_context=metadata_context,
-            group_map=group_map,
-            artifact_map=artifact_map,
-            phase_map=phase_map,
-            support_id_lookup=support_id_lookup,
-            horizon_id=horizon_id,
-            force_intervened_input=False,
-            split_name="val",
-            setting_meta={},
+    selection_status = "best_single"
+    if best_state is None:
+        best_state = fallback_state if fallback_state is not None else clone_state_dict(model)
+        best_epoch = fallback_epoch if fallback_epoch > 0 else max(epochs_ran, 1)
+        best_val_metrics = dict(fallback_metrics)
+        best_val_score = (
+            compute_val_score(best_val_metrics)
+            if math.isfinite(float(best_val_metrics["mae"])) and math.isfinite(float(best_val_metrics["mse"]))
+            else float("nan")
         )
-        top_checkpoints.append(
-            CheckpointSnapshot(
-                epoch=max(epochs_ran, 1),
-                val_mae=float(val_metrics["mae"]),
-                val_mse=float(val_metrics["mse"]),
-                val_score=compute_val_score(val_metrics),
-                state=clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model),
-            )
-        )
+        selection_status = "fallback_no_finite_val"
 
-    top_checkpoints.sort(key=snapshot_sort_key)
-    best_single = top_checkpoints[0]
-    soup_sources = top_checkpoints[: min(checkpoint_soup_k, len(top_checkpoints))]
-    ema_state = clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model)
-    variants: dict[str, dict[str, Any]] = {
-        "best_single": {
-            "state": best_single.state,
-            "source_epochs": [int(best_single.epoch)],
-        },
-        "ema": {
-            "state": ema_state,
-            "source_epochs": [int(max(epochs_ran, 1))],
-        },
-        "soup": {
-            "state": average_state_dicts([snapshot.state for snapshot in soup_sources]),
-            "source_epochs": [int(snapshot.epoch) for snapshot in soup_sources],
-        },
-    }
-
-    for variant_name, payload in variants.items():
-        load_model_state(model, payload["state"])
-        variant_metrics, _ = evaluate_aif_plus(
-            model=model,
-            dataset_bundle=dataset_bundle,
-            events_lookup=events_lookup,
-            eval_rows=val_rows,
-            clean_view_name=clean_view_name,
-            runtime_cfg=runtime_cfg,
-            metadata_context=metadata_context,
-            group_map=group_map,
-            artifact_map=artifact_map,
-            phase_map=phase_map,
-            support_id_lookup=support_id_lookup,
-            horizon_id=horizon_id,
-            force_intervened_input=False,
-            split_name="val",
-            setting_meta={},
-        )
-        payload["val_metrics"] = variant_metrics
-        payload["val_score"] = compute_val_score(variant_metrics)
-        log_progress(
-            f"{log_prefix} checkpoint_variant={variant_name} "
-            f"val_mae={float(variant_metrics['mae']):.6f} val_mse={float(variant_metrics['mse']):.6f} "
-            f"val_score={payload['val_score']:.6f} source_epochs={','.join(str(item) for item in payload['source_epochs'])}"
-        )
-
-    load_model_state(model, variants["soup"]["state"])
-    if ema is not None:
-        ema.load_state_dict(variants["soup"]["state"])
-
+    load_model_state(model, best_state)
     return {
         "epochs_ran": int(epochs_ran),
-        "variants": variants,
-        "top_checkpoints": [
-            {
-                "epoch": int(snapshot.epoch),
-                "val_mae": float(snapshot.val_mae),
-                "val_mse": float(snapshot.val_mse),
-                "val_score": float(snapshot.val_score),
-            }
-            for snapshot in top_checkpoints
-        ],
+        "best_epoch": int(best_epoch),
+        "best_state": best_state,
+        "best_val_metrics": best_val_metrics,
+        "best_val_score": float(best_val_score),
+        "selection_status": selection_status,
+        "checkpoint_variant": "best_single",
+        "checkpoint_source_epochs": [int(best_epoch)],
     }
 
 
@@ -1022,8 +880,8 @@ def build_summary_markdown(
 ) -> str:
     merged = compare_against_baseline(aif_df, baseline_df)
     intro = summary_note or (
-        "本轮采用 clean-first 的 AIF-Plus：clean trunk 仅看 x_masked，训练目标为 0.7*MAE + 0.3*MSE，"
-        "验证使用 EMA，最终测试使用 checkpoint soup。"
+        "本轮采用 clean-first 的 AIF-Plus：single-stage clean-first training，"
+        "loss=0.7*MAE+0.3*MSE，best-single checkpoint selection。"
     )
     lines = [
         f"# {summary_title}",
@@ -1048,7 +906,7 @@ def build_summary_markdown(
         lines.append("- 当前没有可与 ERM baseline 对齐的 AIF-Plus 结果。")
 
     if checkpoint_df is not None and not checkpoint_df.empty:
-        lines.extend(["", "## Checkpoint Comparison", ""])
+        lines.extend(["", "## Checkpoint Selection", ""])
         raw_cmp = checkpoint_df[checkpoint_df["eval_view_name"] == "raw"].copy()
         if raw_cmp.empty:
             raw_cmp = checkpoint_df.copy()
@@ -1104,31 +962,50 @@ def sort_results_frame(results_df: pd.DataFrame) -> pd.DataFrame:
     return results_df.sort_values(existing).reset_index(drop=True)
 
 
-def sort_window_errors_frame(window_errors_df: pd.DataFrame) -> pd.DataFrame:
-    if window_errors_df.empty:
-        return window_errors_df
-    sort_columns = [
-        "dataset_name",
-        "backbone",
-        "lookback",
-        "horizon",
-        "train_view_name",
-        "eval_view_name",
-        "checkpoint_variant",
-        "window_id",
-    ]
-    existing = [column for column in sort_columns if column in window_errors_df.columns]
-    return window_errors_df.sort_values(existing).reset_index(drop=True)
+def resolve_optional_output_path(path_text: str) -> Path | None:
+    text = str(path_text).strip()
+    if not text:
+        return None
+    return ROOT_DIR / Path(text)
+
+
+def make_val_debug_window_error_path(window_errors_out: Path | None) -> Path | None:
+    if window_errors_out is None:
+        return None
+    return window_errors_out.with_name(f"{window_errors_out.stem}_val_debug{window_errors_out.suffix}")
 
 
 def main() -> None:
     args = parse_args()
+    args.results_out = with_run_tag(args.results_out, str(Path("results") / "aif_plus_results.csv"), args.run_tag)
+    args.window_errors_out = with_run_tag(
+        args.window_errors_out,
+        str(Path("results") / "aif_plus_window_errors.csv"),
+        args.run_tag,
+    )
+    args.arg_out = with_run_tag(args.arg_out, str(Path("results") / "aif_plus_artifact_reliance_gap.csv"), args.run_tag)
+    args.wgr_out = with_run_tag(args.wgr_out, str(Path("results") / "aif_plus_worst_group_risk.csv"), args.run_tag)
+    args.ri_out = with_run_tag(args.ri_out, str(Path("results") / "aif_plus_ranking_instability.csv"), args.run_tag)
+    args.report_out = with_run_tag(args.report_out, str(Path("reports") / "aif_plus_summary.md"), args.run_tag)
+    if args.checkpoint_comparison_out:
+        args.checkpoint_comparison_out = with_run_tag(
+            args.checkpoint_comparison_out,
+            "",
+            args.run_tag,
+        )
+
     config = load_config(ROOT_DIR / Path(args.config))
     defaults = dict(config.get("defaults", {}))
     experiment_meta = resolve_experiment_meta(defaults)
-    datasets = [canonicalize_dataset_name(str(name)) for name in defaults.get("datasets", [])]
-    horizons = [int(item) for item in defaults.get("horizons", [])]
-    seeds = [int(item) for item in defaults.get("seeds", [0])]
+    datasets = resolve_cli_subset(args.datasets, lambda item: canonicalize_dataset_name(str(item)))
+    if datasets is None:
+        datasets = [canonicalize_dataset_name(str(name)) for name in defaults.get("datasets", [])]
+    horizons = resolve_cli_subset(args.horizons, int)
+    if horizons is None:
+        horizons = [int(item) for item in defaults.get("horizons", [])]
+    seeds = resolve_cli_subset(args.seeds, int)
+    if seeds is None:
+        seeds = [int(item) for item in defaults.get("seeds", [0])]
     dataset_id_map = {name: idx for idx, name in enumerate(datasets)}
     horizon_id_map = {int(value): idx for idx, value in enumerate(horizons)}
     views_dir = ROOT_DIR / Path(args.views_dir)
@@ -1136,28 +1013,36 @@ def main() -> None:
     events_path = ROOT_DIR / Path(args.events)
     support_summary_path = ROOT_DIR / Path(args.support_summary)
     baseline_results_path = ROOT_DIR / Path(args.baseline_results)
-    results_out = ROOT_DIR / Path(args.results_out)
-    window_errors_out = ROOT_DIR / Path(args.window_errors_out)
-    arg_out = ROOT_DIR / Path(args.arg_out)
-    wgr_out = ROOT_DIR / Path(args.wgr_out)
-    ri_out = ROOT_DIR / Path(args.ri_out)
-    report_out = ROOT_DIR / Path(args.report_out)
-    checkpoint_out = ROOT_DIR / Path(args.checkpoint_comparison_out) if args.checkpoint_comparison_out else None
-    output_paths = [results_out, window_errors_out, arg_out, wgr_out, ri_out, report_out]
-    if checkpoint_out is not None:
-        output_paths.append(checkpoint_out)
+    results_out = resolve_optional_output_path(args.results_out)
+    window_errors_out = resolve_optional_output_path(args.window_errors_out)
+    arg_out = resolve_optional_output_path(args.arg_out)
+    wgr_out = resolve_optional_output_path(args.wgr_out)
+    ri_out = resolve_optional_output_path(args.ri_out)
+    report_out = resolve_optional_output_path(args.report_out)
+    checkpoint_out = resolve_optional_output_path(args.checkpoint_comparison_out)
+    val_debug_window_errors_out = make_val_debug_window_error_path(window_errors_out) if args.debug_write_val_window_errors else None
+    output_paths = [path for path in [results_out, arg_out, wgr_out, ri_out, report_out, checkpoint_out] if path is not None]
+    if args.write_window_errors and window_errors_out is not None:
+        output_paths.append(window_errors_out)
+    if val_debug_window_errors_out is not None:
+        output_paths.append(val_debug_window_errors_out)
     for path in output_paths:
         path.parent.mkdir(parents=True, exist_ok=True)
-    if window_errors_out.exists():
+    if args.write_window_errors and window_errors_out is not None and window_errors_out.exists():
         window_errors_out.unlink()
+    if val_debug_window_errors_out is not None and val_debug_window_errors_out.exists():
+        val_debug_window_errors_out.unlink()
     support_vocab = load_support_vocab(support_summary_path)
 
     result_rows: list[dict[str, Any]] = []
     checkpoint_rows: list[dict[str, Any]] = []
-    log_progress(f"start datasets={datasets} horizons={horizons}")
+    log_progress(
+        f"start run_tag={args.run_tag or 'default'} datasets={datasets} horizons={horizons} seeds={seeds} "
+        f"write_window_errors={bool(args.write_window_errors)} rich_window_errors={bool(args.window_error_rich_fields)}"
+    )
 
     for dataset_name in datasets:
-        dataset_cfg = resolve_aif_plus_dataset_config(defaults, dataset_name)
+        dataset_cfg = resolve_aif_plus_dataset_config(defaults, dataset_name, config_source_path=args.config)
         runtime_cfg = dict(dataset_cfg["runtime"])
         model_cfg = dict(dataset_cfg["model"])
         loss_cfg = dict(dataset_cfg["loss"])
@@ -1230,15 +1115,6 @@ def main() -> None:
                     )
                 )
                 model.to(device)
-                ema = (
-                    ModelEMA(
-                        model,
-                        decay=float(runtime_cfg.get("ema_decay", 0.999)),
-                        device=str(runtime_cfg.get("ema_device", "same")),
-                    )
-                    if bool(runtime_cfg.get("use_ema", True))
-                    else None
-                )
                 pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
                 train_loader = build_loader(
                     AIFPlusWindowDataset(
@@ -1260,9 +1136,8 @@ def main() -> None:
                     pin_memory=pin_memory,
                 )
 
-                train_info = fit_aif_v4(
+                train_info = fit_aif_plus_best_single(
                     model=model,
-                    ema=ema,
                     train_loader=train_loader,
                     val_rows=val_rows,
                     dataset_bundle=dataset_bundle,
@@ -1278,119 +1153,134 @@ def main() -> None:
                     horizon_id=horizon_id_map[horizon],
                     seed=seed,
                     log_prefix=log_prefix,
+                    val_window_error_path=val_debug_window_errors_out,
+                    window_error_rich_fields=bool(args.window_error_rich_fields),
+                    val_setting_meta={
+                        "dataset_name": dataset_name,
+                        "backbone": experiment_meta["backbone_name"],
+                        "lookback": lookback,
+                        "horizon": horizon,
+                        "train_view_name": experiment_meta["train_view_name"],
+                        "eval_view_name": "val",
+                        "seed": seed,
+                        "checkpoint_variant": "best_single",
+                    },
                 )
 
-                for variant_name, variant_payload in train_info["variants"].items():
-                    load_model_state(model, variant_payload["state"])
-                    source_epochs_text = ",".join(str(item) for item in variant_payload["source_epochs"])
-                    for eval_view_name, force_intervened_input in [
-                        ("raw", False),
-                        (clean_view_name, False),
-                        ("intervened", True),
-                    ]:
-                        eval_rows = select_view_rows(
-                            view_df,
-                            split_name="test",
-                            view_name=eval_view_name,
-                            max_rows=runtime_cfg.get("max_test_windows"),
-                        )
-                        if eval_rows.empty:
-                            continue
-                        collect_error_rows = variant_name == "soup"
-                        error_setting_meta = (
-                            {
-                                "dataset_name": dataset_name,
-                                "backbone": experiment_meta["backbone_name"],
-                                "lookback": lookback,
-                                "horizon": horizon,
-                                "train_view_name": experiment_meta["train_view_name"],
-                                "eval_view_name": eval_view_name,
-                                "checkpoint_variant": variant_name,
-                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                            }
-                            if collect_error_rows
-                            else None
-                        )
-                        metrics, errors = evaluate_aif_plus(
-                            model=model,
-                            dataset_bundle=dataset_bundle,
-                            events_lookup=events_lookup,
-                            eval_rows=eval_rows,
-                            clean_view_name=clean_view_name,
-                            runtime_cfg=runtime_cfg,
-                            metadata_context=metadata_context,
-                            group_map=group_map,
-                            artifact_map=artifact_map,
-                            phase_map=phase_map,
-                            support_id_lookup=support_id_lookup,
-                            horizon_id=horizon_id_map[horizon],
-                            force_intervened_input=force_intervened_input,
-                            split_name="test",
-                            setting_meta=error_setting_meta,
-                            collect_error_rows=collect_error_rows,
-                        )
-                        checkpoint_rows.append(
-                            {
-                                "dataset_name": dataset_name,
-                                "backbone": experiment_meta["backbone_name"],
-                                "lookback": lookback,
-                                "horizon": horizon,
-                                "train_view_name": experiment_meta["train_view_name"],
-                                "eval_view_name": eval_view_name,
-                                "seed": seed,
-                                "checkpoint_variant": variant_name,
-                                "checkpoint_source_epochs": source_epochs_text,
-                                "selected_for_final": int(variant_name == "soup"),
-                                "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                                "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                                "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                                "n_train_windows": int(len(train_rows)),
-                                "n_eval_windows": int(len(eval_rows)),
-                                "epochs_ran": int(train_info["epochs_ran"]),
-                                "val_mae": round(float(variant_payload["val_metrics"]["mae"]), 6),
-                                "val_mse": round(float(variant_payload["val_metrics"]["mse"]), 6),
-                                "val_score": round(float(variant_payload["val_score"]), 6),
-                                "mae": round(float(metrics["mae"]), 6),
-                                "mse": round(float(metrics["mse"]), 6),
-                                "smape": round(float(metrics["smape"]), 6),
-                            }
-                        )
-                        if variant_name == "soup":
-                            result_rows.append(
-                                {
-                                    "dataset_name": dataset_name,
-                                    "backbone": experiment_meta["backbone_name"],
-                                    "lookback": lookback,
-                                    "horizon": horizon,
-                                    "train_view_name": experiment_meta["train_view_name"],
-                                    "eval_view_name": eval_view_name,
-                                    "seed": seed,
-                                    "checkpoint_variant": variant_name,
-                                    "checkpoint_source_epochs": source_epochs_text,
-                                    "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
-                                    "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
-                                    "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
-                                    "n_train_windows": int(len(train_rows)),
-                                    "n_eval_windows": int(len(eval_rows)),
-                                    "epochs_ran": int(train_info["epochs_ran"]),
-                                    "best_val_mae": round(float(variant_payload["val_metrics"]["mae"]), 6),
-                                    "best_val_mse": round(float(variant_payload["val_metrics"]["mse"]), 6),
-                                    "best_val_score": round(float(variant_payload["val_score"]), 6),
-                                    "mae": round(float(metrics["mae"]), 6),
-                                    "mse": round(float(metrics["mse"]), 6),
-                                    "smape": round(float(metrics["smape"]), 6),
-                                }
-                            )
-                            append_window_error_rows(window_errors_out, errors or [])
-                        log_progress(
-                            f"done dataset={dataset_name} L{lookback} H{horizon} seed={seed} "
-                            f"variant={variant_name} view={eval_view_name} mae={float(metrics['mae']):.6f}"
-                        )
+                load_model_state(model, train_info["best_state"])
+                source_epochs_text = ",".join(str(item) for item in train_info["checkpoint_source_epochs"])
+                for eval_view_name, force_intervened_input in [
+                    ("raw", False),
+                    (clean_view_name, False),
+                    ("intervened", True),
+                ]:
+                    eval_rows = select_view_rows(
+                        view_df,
+                        split_name="test",
+                        view_name=eval_view_name,
+                        max_rows=runtime_cfg.get("max_test_windows"),
+                    )
+                    if eval_rows.empty:
+                        continue
+                    error_setting_meta = {
+                        "dataset_name": dataset_name,
+                        "backbone": experiment_meta["backbone_name"],
+                        "lookback": lookback,
+                        "horizon": horizon,
+                        "train_view_name": experiment_meta["train_view_name"],
+                        "eval_view_name": eval_view_name,
+                        "seed": seed,
+                        "checkpoint_variant": train_info["checkpoint_variant"],
+                    }
+                    metrics = evaluate_aif_plus(
+                        model=model,
+                        dataset_bundle=dataset_bundle,
+                        events_lookup=events_lookup,
+                        eval_rows=eval_rows,
+                        clean_view_name=clean_view_name,
+                        runtime_cfg=runtime_cfg,
+                        metadata_context=metadata_context,
+                        group_map=group_map,
+                        artifact_map=artifact_map,
+                        phase_map=phase_map,
+                        support_id_lookup=support_id_lookup,
+                        horizon_id=horizon_id_map[horizon],
+                        force_intervened_input=force_intervened_input,
+                        split_name="test",
+                        setting_meta=error_setting_meta,
+                        window_error_path=window_errors_out,
+                        write_window_errors=bool(args.write_window_errors) and window_errors_out is not None,
+                        window_error_rich_fields=bool(args.window_error_rich_fields),
+                    )
+                    checkpoint_rows.append(
+                        {
+                            "dataset_name": dataset_name,
+                            "backbone": experiment_meta["backbone_name"],
+                            "lookback": lookback,
+                            "horizon": horizon,
+                            "train_view_name": experiment_meta["train_view_name"],
+                            "eval_view_name": eval_view_name,
+                            "seed": seed,
+                            "checkpoint_variant": train_info["checkpoint_variant"],
+                            "checkpoint_source_epochs": source_epochs_text,
+                            "selected_for_final": 1,
+                            "selection_status": train_info["selection_status"],
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                            "n_train_windows": int(len(train_rows)),
+                            "n_eval_windows": int(metrics["n_total_windows"]),
+                            "n_total_windows": int(metrics["n_total_windows"]),
+                            "n_valid_windows": int(metrics["n_valid_windows"]),
+                            "n_invalid_windows": int(metrics["n_invalid_windows"]),
+                            "invalid_ratio": round(float(metrics["invalid_ratio"]), 6),
+                            "epochs_ran": int(train_info["epochs_ran"]),
+                            "best_epoch": int(train_info["best_epoch"]),
+                            "val_mae": round(float(train_info["best_val_metrics"]["mae"]), 6),
+                            "val_mse": round(float(train_info["best_val_metrics"]["mse"]), 6),
+                            "val_score": round(float(train_info["best_val_score"]), 6),
+                            "mae": round(float(metrics["mae"]), 6),
+                            "mse": round(float(metrics["mse"]), 6),
+                            "smape": round(float(metrics["smape"]), 6),
+                        }
+                    )
+                    result_rows.append(
+                        {
+                            "dataset_name": dataset_name,
+                            "backbone": experiment_meta["backbone_name"],
+                            "lookback": lookback,
+                            "horizon": horizon,
+                            "train_view_name": experiment_meta["train_view_name"],
+                            "eval_view_name": eval_view_name,
+                            "seed": seed,
+                            "checkpoint_variant": train_info["checkpoint_variant"],
+                            "checkpoint_source_epochs": source_epochs_text,
+                            "hyperparam_source_kind": dataset_cfg["hyperparam_source_kind"],
+                            "hyperparam_source_url": dataset_cfg["hyperparam_source_url"],
+                            "hyperparam_source_note": dataset_cfg["hyperparam_source_note"],
+                            "n_train_windows": int(len(train_rows)),
+                            "n_eval_windows": int(metrics["n_total_windows"]),
+                            "n_total_windows": int(metrics["n_total_windows"]),
+                            "n_valid_windows": int(metrics["n_valid_windows"]),
+                            "n_invalid_windows": int(metrics["n_invalid_windows"]),
+                            "invalid_ratio": round(float(metrics["invalid_ratio"]), 6),
+                            "epochs_ran": int(train_info["epochs_ran"]),
+                            "best_epoch": int(train_info["best_epoch"]),
+                            "best_val_mae": round(float(train_info["best_val_metrics"]["mae"]), 6),
+                            "best_val_mse": round(float(train_info["best_val_metrics"]["mse"]), 6),
+                            "best_val_score": round(float(train_info["best_val_score"]), 6),
+                            "mae": round(float(metrics["mae"]), 6),
+                            "mse": round(float(metrics["mse"]), 6),
+                            "smape": round(float(metrics["smape"]), 6),
+                        }
+                    )
+                    log_progress(
+                        f"done dataset={dataset_name} L{lookback} H{horizon} seed={seed} "
+                        f"variant={train_info['checkpoint_variant']} view={eval_view_name} "
+                        f"mae={float(metrics['mae']):.6f} valid={int(metrics['n_valid_windows'])}/{int(metrics['n_total_windows'])}"
+                    )
                 del train_info
                 del train_loader
-                del ema
                 del model
                 gc.collect()
                 if torch.cuda.is_available():
@@ -1402,37 +1292,38 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     results_df = sort_results_frame(pd.DataFrame(result_rows))
-    window_errors_df = sort_window_errors_frame(
-        pd.read_csv(window_errors_out, low_memory=False) if window_errors_out.exists() else pd.DataFrame()
-    )
     checkpoint_df = sort_results_frame(pd.DataFrame(checkpoint_rows))
-    arg_df = compute_aif_arg_table(results_df)
-    wgr_df = compute_aif_wgr_table(window_errors_df)
-    ri_df = compute_aif_ri_table(results_df)
+    arg_df = compute_aif_arg_table(results_df) if arg_out is not None or report_out is not None else pd.DataFrame()
+    ri_df = compute_aif_ri_table(results_df) if ri_out is not None or report_out is not None else pd.DataFrame()
+    wgr_df = compute_aif_wgr_table(pd.DataFrame()) if wgr_out is not None or report_out is not None else pd.DataFrame()
 
-    results_df.to_csv(results_out, index=False)
-    window_errors_df.to_csv(window_errors_out, index=False)
-    arg_df.to_csv(arg_out, index=False)
-    wgr_df.to_csv(wgr_out, index=False)
-    ri_df.to_csv(ri_out, index=False)
+    if results_out is not None:
+        results_df.to_csv(results_out, index=False)
     if checkpoint_out is not None:
         checkpoint_df.to_csv(checkpoint_out, index=False)
+    if arg_out is not None:
+        arg_df.to_csv(arg_out, index=False)
+    if wgr_out is not None:
+        wgr_df.to_csv(wgr_out, index=False)
+    if ri_out is not None:
+        ri_df.to_csv(ri_out, index=False)
 
-    baseline_df = pd.read_csv(baseline_results_path, low_memory=False) if baseline_results_path.exists() else pd.DataFrame()
-    write_markdown(
-        report_out,
-        build_summary_markdown(
-            results_df,
-            baseline_df,
-            arg_df,
-            wgr_df,
-            ri_df,
-            checkpoint_df=checkpoint_df,
-            summary_title=experiment_meta["summary_title"],
-            display_name=experiment_meta["display_name"],
-            summary_note=experiment_meta["summary_note"],
-        ),
-    )
+    if report_out is not None:
+        baseline_df = pd.read_csv(baseline_results_path, low_memory=False) if baseline_results_path.exists() else pd.DataFrame()
+        write_markdown(
+            report_out,
+            build_summary_markdown(
+                results_df,
+                baseline_df,
+                arg_df,
+                wgr_df,
+                ri_df,
+                checkpoint_df=checkpoint_df,
+                summary_title=experiment_meta["summary_title"],
+                display_name=experiment_meta["display_name"],
+                summary_note=experiment_meta["summary_note"],
+            ),
+        )
     log_progress(f"finished results_out={results_out} rows={len(results_df)}")
 
 

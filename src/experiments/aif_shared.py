@@ -184,7 +184,7 @@ def compute_aif_ri_table(results_df: pd.DataFrame) -> pd.DataFrame:
         }
         if "raw" not in by_view:
             continue
-        for compare_view in ["balanced", "clean_like", "intervened"]:
+        for compare_view in sorted(view_name for view_name in by_view if view_name != "raw"):
             if compare_view not in by_view:
                 continue
             ref_frame = by_view["raw"]

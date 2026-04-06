@@ -1,0 +1,122 @@
+defaults:
+  experiment_name: AIF-Plus-V5
+  backbone_name: AIFPlusV5
+  train_view_name: aif_plus_v5
+  summary_title: AIF-Plus-V5 Summary
+  summary_note: 本轮采用 AIF-Plus-V5 单阶段 clean-first 训练，loss=0.7*MAE+0.3*MSE，best-single checkpoint 选择，最终结果以 finite-window recomputation 为准。
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  use_dataset_presets: false
+  use_preset_lookback: false
+  prefer_config_model_over_presets: true
+  aux_label_mode: label_free_aux
+  view_alias:
+    ETTh1:
+      clean_like: clean_like
+    ETTh2:
+      clean_like: clean_like
+    ETTm1:
+      clean_like: clean_like
+    ETTm2:
+      clean_like: clean_like
+    solar_AL:
+      clean_like: balanced
+    weather:
+      clean_like: clean_like
+    exchange_rate:
+      clean_like: clean_like
+    electricity:
+      clean_like: natural_clean
+  model:
+    d_model: 256
+    dropout: 0.05
+    n_heads: 8
+    n_patch_layers: 2
+    n_decoder_layers: 2
+    ffn_ratio: 4
+    use_diff_branch: true
+    patch_len_small: 8
+    patch_stride_small: 4
+    patch_len_large: 16
+    patch_stride_large: 8
+    patch_jitter: true
+    periods: [24, 48, 96]
+    queries_per_period: 2
+    spectral_topk: 8
+    residual_hidden: 32
+    lambda_res_max: 0.01
+    activation_checkpointing: true
+    bc_chunk_size: 1024
+  runtime:
+    device: auto
+    batch_size: 48
+    eval_batch_size: 96
+    epochs: 35
+    lr: 0.0002
+    weight_decay: 0.05
+    grad_clip: 1.0
+    warmup_ratio: 0.05
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    patience: 8
+    max_train_windows: 12000
+    max_val_windows: 3000
+    max_test_windows:
+  loss:
+    mae_weight: 0.7
+    mse_weight: 0.3
+  dataset_overrides:
+    ETTh1:
+      model:
+        use_diff_branch: false
+        patch_jitter: false
+        dropout: 0.03
+        queries_per_period: 3
+        lambda_res_max: 0.005
+      runtime:
+        lr: 0.00015
+        epochs: 50
+        patience: 10
+    ETTh2:
+      model:
+        lambda_res_max: 0.0075
+    ETTm1:
+      model:
+        lambda_res_max: 0.0075
+    ETTm2:
+      model:
+        lambda_res_max: 0.0075
+    exchange_rate:
+      model:
+        lambda_res_max: 0.0075
+    weather:
+      model:
+        d_model: 320
+        n_decoder_layers: 3
+        queries_per_period: 3
+        spectral_topk: 12
+        patch_jitter: false
+        dropout: 0.03
+        lambda_res_max: 0.01
+      runtime:
+        batch_size: 24
+        eval_batch_size: 48
+        lr: 0.00015
+        epochs: 50
+        patience: 10
+    electricity:
+      model:
+        lambda_res_max: 0.012
+      runtime:
+        batch_size: 16
+        eval_batch_size: 32
+    solar_AL:
+      model:
+        dropout: 0.1
+        lambda_res_max: 0.025
+      runtime:
+        batch_size: 24
+        eval_batch_size: 48

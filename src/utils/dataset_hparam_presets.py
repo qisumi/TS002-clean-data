@@ -545,7 +545,11 @@ def _preset_source_note(model_name: str, use_preset_lookback: bool) -> str:
     return f"{model_name} dataset preset with current config lookback preserved."
 
 
-def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str) -> dict[str, Any]:
+def resolve_aif_plus_dataset_config(
+    defaults: dict[str, Any],
+    dataset_name: str,
+    config_source_path: str = "configs/aif_plus.yaml",
+) -> dict[str, Any]:
     runtime_cfg = _copy_dict(defaults.get("runtime"))
     model_cfg = _copy_dict(defaults.get("model"))
     loss_cfg = _copy_dict(defaults.get("loss"))
@@ -558,7 +562,7 @@ def resolve_aif_plus_dataset_config(defaults: dict[str, Any], dataset_name: str)
     lookback = int(defaults.get("lookback", 96))
 
     source_kind = "config_default"
-    source_url = "configs/aif_plus.yaml"
+    source_url = str(config_source_path or "configs/aif_plus.yaml")
     source_note = "AIF-Plus default config"
 
     if use_dataset_presets:
