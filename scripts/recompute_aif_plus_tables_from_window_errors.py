@@ -37,7 +37,7 @@ APPENDIX_DATASETS = {"ETTm2", "electricity"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Recompute AIF-Plus V5 tables from shard window errors.")
+    parser = argparse.ArgumentParser(description="Recompute AIF-Plus tables from shard window errors.")
     parser.add_argument("--window-errors", nargs="+", required=True)
     parser.add_argument("--results-online", nargs="+", required=True)
     parser.add_argument("--chunksize", type=int, default=250000)
@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-board-out", default=str(Path("results") / "aif_plus_v5_boundary_board.csv"))
     parser.add_argument("--appendix-board-out", default=str(Path("results") / "aif_plus_v5_appendix_board.csv"))
     parser.add_argument("--summary-out", default=str(Path("reports") / "aif_plus_v5_summary.md"))
+    parser.add_argument("--summary-title", default="AIF-Plus Summary")
     return parser.parse_args()
 
 
@@ -387,13 +388,14 @@ def build_summary_markdown(
     boundary_df: pd.DataFrame,
     appendix_df: pd.DataFrame,
     merged_window_errors_out: Path | None,
+    summary_title: str,
 ) -> str:
     if "n_valid_windows" in diagnostics_df.columns:
         zero_valid_df = diagnostics_df.loc[diagnostics_df["n_valid_windows"].fillna(0).astype(int) <= 0].copy()
     else:
         zero_valid_df = pd.DataFrame(columns=diagnostics_df.columns)
     lines = [
-        "# AIF-Plus-V5 Summary",
+        f"# {summary_title}",
         "",
         "最终表格以 `window_errors.csv` 的 finite-window recomputation 为准。训练阶段在线聚合只用于监控，不作为最终论文表格依据。",
         "",
@@ -501,6 +503,7 @@ def main() -> None:
             boundary_df=boundary_df,
             appendix_df=appendix_df,
             merged_window_errors_out=merged_window_errors_out,
+            summary_title=str(args.summary_title or "AIF-Plus Summary"),
         ),
         encoding="utf-8",
     )

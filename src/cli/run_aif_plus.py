@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import importlib.util
@@ -150,6 +151,102 @@ def load_model_state(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> 
     unwrap_model(module).load_state_dict(state_dict)
 
 
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float, device: str = "same") -> None:
+        self.decay = float(decay)
+        base_model = unwrap_model(model)
+        if hasattr(base_model, "config"):
+            self.shadow = type(base_model)(base_model.config).eval()
+            self.shadow.load_state_dict(clone_tensor_state_dict(base_model.state_dict()))
+        else:
+            self.shadow = copy.deepcopy(base_model).eval()
+        target_device = str(device).strip().lower()
+        if target_device in {"", "same", "model"}:
+            shadow_device = next(base_model.parameters()).device
+        else:
+            shadow_device = torch.device(target_device)
+        self._shadow_device = shadow_device
+        self.shadow.to(shadow_device)
+        for param in self.shadow.parameters():
+            param.requires_grad_(False)
+        self._state_names = tuple(self.shadow.state_dict().keys())
+        self._update_scratch_state: dict[str, torch.Tensor] = {}
+        self._backup_state: dict[str, torch.Tensor] = (
+            self._update_scratch_state if self._shadow_device.type == "cpu" else {}
+        )
+        self._backup_ready = False
+
+    @staticmethod
+    def _ensure_tensor_slot(
+        storage: dict[str, torch.Tensor],
+        name: str,
+        reference: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        scratch = storage.get(name)
+        if scratch is None or scratch.shape != reference.shape or scratch.dtype != reference.dtype or scratch.device != device:
+            scratch = torch.empty_like(reference, device=device)
+            storage[name] = scratch
+        return scratch
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        if self._backup_ready:
+            raise RuntimeError("EMA update called while a live model backup is still active")
+        model_state = unwrap_model(model).state_dict()
+        shadow_state = self.shadow.state_dict()
+        for name in self._state_names:
+            value = shadow_state[name]
+            source = model_state[name].detach()
+            if source.device != value.device:
+                source_shadow = self._ensure_tensor_slot(
+                    self._update_scratch_state,
+                    name,
+                    value,
+                    device=value.device,
+                )
+                source_shadow.copy_(source, non_blocking=False)
+                source = source_shadow
+            if not torch.is_floating_point(source):
+                value.copy_(source)
+                continue
+            value.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.shadow.state_dict()
+
+    @torch.no_grad()
+    def store(self, model: nn.Module) -> None:
+        model_state = unwrap_model(model).state_dict()
+        shadow_state = self.shadow.state_dict()
+        for name in self._state_names:
+            backup = self._ensure_tensor_slot(
+                self._backup_state,
+                name,
+                shadow_state[name],
+                device=torch.device("cpu"),
+            )
+            backup.copy_(model_state[name], non_blocking=False)
+        self._backup_ready = True
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        model_state = unwrap_model(model).state_dict()
+        shadow_state = self.shadow.state_dict()
+        for name in self._state_names:
+            model_state[name].copy_(shadow_state[name], non_blocking=False)
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if not self._backup_ready:
+            raise RuntimeError("EMA restore called before store")
+        model_state = unwrap_model(model).state_dict()
+        for name in self._state_names:
+            model_state[name].copy_(self._backup_state[name], non_blocking=False)
+        self._backup_ready = False
+
+
 class WindowErrorCSVWriter:
     def __init__(self, path: Path, *, rich_fields: bool = False) -> None:
         self.path = path
@@ -179,6 +276,76 @@ class WindowErrorCSVWriter:
         if not rows or self._writer is None:
             return
         self._writer.writerows(rows)
+
+
+def evaluate_with_ema_state(
+    *,
+    model: nn.Module,
+    ema: ModelEMA | None,
+    dataset_bundle: Any,
+    events_lookup: dict[str, dict[str, Any]],
+    eval_rows: pd.DataFrame,
+    clean_view_name: str,
+    runtime_cfg: dict[str, Any],
+    metadata_context: dict[str, Any],
+    group_map: dict[str, int],
+    artifact_map: dict[str, int],
+    phase_map: dict[str, int],
+    support_id_lookup: dict[str, int],
+    horizon_id: int,
+    force_intervened_input: bool,
+    split_name: str,
+    setting_meta: dict[str, Any] | None,
+    window_error_path: Path | None = None,
+    write_window_errors: bool = False,
+    window_error_rich_fields: bool = False,
+) -> dict[str, float]:
+    if ema is None:
+        return evaluate_aif_plus(
+            model=model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=eval_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=force_intervened_input,
+            split_name=split_name,
+            setting_meta=setting_meta,
+            window_error_path=window_error_path,
+            write_window_errors=write_window_errors,
+            window_error_rich_fields=window_error_rich_fields,
+        )
+    ema.store(model)
+    ema.copy_to(model)
+    try:
+        return evaluate_aif_plus(
+            model=model,
+            dataset_bundle=dataset_bundle,
+            events_lookup=events_lookup,
+            eval_rows=eval_rows,
+            clean_view_name=clean_view_name,
+            runtime_cfg=runtime_cfg,
+            metadata_context=metadata_context,
+            group_map=group_map,
+            artifact_map=artifact_map,
+            phase_map=phase_map,
+            support_id_lookup=support_id_lookup,
+            horizon_id=horizon_id,
+            force_intervened_input=force_intervened_input,
+            split_name=split_name,
+            setting_meta=setting_meta,
+            window_error_path=window_error_path,
+            write_window_errors=write_window_errors,
+            window_error_rich_fields=window_error_rich_fields,
+        )
+    finally:
+        ema.restore(model)
 
 
 def compute_val_score(metrics: dict[str, float]) -> float:
@@ -671,6 +838,7 @@ def build_model_config(
 def fit_aif_plus_best_single(
     *,
     model: nn.Module,
+    ema: ModelEMA | None,
     train_loader: DataLoader[Any],
     val_rows: pd.DataFrame,
     dataset_bundle: Any,
@@ -715,6 +883,7 @@ def fit_aif_plus_best_single(
     )
     grad_clip = float(runtime_cfg.get("grad_clip", 1.0))
     patience = int(runtime_cfg.get("patience", 8))
+    checkpoint_variant = "best_ema_single" if ema is not None else "best_single"
 
     best_state: dict[str, torch.Tensor] | None = None
     best_epoch = 0
@@ -736,7 +905,7 @@ def fit_aif_plus_best_single(
     set_random_seed(seed)
     log_progress(
         f"{log_prefix} fit start epochs={epochs} lr={float(runtime_cfg.get('lr', 2e-4)):.2e} "
-        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)} checkpoint=best_single"
+        f"train_rows={len(train_loader.dataset)} val_rows={len(val_rows)} checkpoint={checkpoint_variant}"
     )
 
     for epoch in range(1, epochs + 1):
@@ -772,14 +941,17 @@ def fit_aif_plus_best_single(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if ema is not None:
+                ema.update(model)
 
             train_loss_sum += float(loss.detach().cpu().item())
             train_mae_sum += float(loss_terms["mae"].detach().cpu().item())
             train_mse_sum += float(loss_terms["mse"].detach().cpu().item())
             train_batches += 1
 
-        val_metrics = evaluate_aif_plus(
+        val_metrics = evaluate_with_ema_state(
             model=model,
+            ema=ema,
             dataset_bundle=dataset_bundle,
             events_lookup=events_lookup,
             eval_rows=val_rows,
@@ -804,7 +976,7 @@ def fit_aif_plus_best_single(
         epochs_ran = epoch
 
         if fallback_state is None:
-            fallback_state = clone_state_dict(model)
+            fallback_state = clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model)
             fallback_epoch = epoch
             fallback_metrics = dict(val_metrics)
 
@@ -830,7 +1002,7 @@ def fit_aif_plus_best_single(
                 best_epoch if best_epoch > 0 else 10**9,
             )
             if best_state is None or current_key < best_key:
-                best_state = clone_state_dict(model)
+                best_state = clone_tensor_state_dict(ema.state_dict()) if ema is not None else clone_state_dict(model)
                 best_epoch = epoch
                 best_val_metrics = dict(val_metrics)
                 best_val_score = current_val_score
@@ -841,7 +1013,7 @@ def fit_aif_plus_best_single(
         if patience_counter >= patience:
             break
 
-    selection_status = "best_single"
+    selection_status = checkpoint_variant
     if best_state is None:
         best_state = fallback_state if fallback_state is not None else clone_state_dict(model)
         best_epoch = fallback_epoch if fallback_epoch > 0 else max(epochs_ran, 1)
@@ -851,7 +1023,7 @@ def fit_aif_plus_best_single(
             if math.isfinite(float(best_val_metrics["mae"])) and math.isfinite(float(best_val_metrics["mse"]))
             else float("nan")
         )
-        selection_status = "fallback_no_finite_val"
+        selection_status = f"fallback_no_finite_val:{checkpoint_variant}"
 
     load_model_state(model, best_state)
     return {
@@ -861,7 +1033,7 @@ def fit_aif_plus_best_single(
         "best_val_metrics": best_val_metrics,
         "best_val_score": float(best_val_score),
         "selection_status": selection_status,
-        "checkpoint_variant": "best_single",
+        "checkpoint_variant": checkpoint_variant,
         "checkpoint_source_epochs": [int(best_epoch)],
     }
 
@@ -1115,6 +1287,16 @@ def main() -> None:
                     )
                 )
                 model.to(device)
+                ema = (
+                    ModelEMA(
+                        model,
+                        decay=float(runtime_cfg.get("ema_decay", 0.999)),
+                        device=str(runtime_cfg.get("ema_device", "same")),
+                    )
+                    if bool(runtime_cfg.get("use_ema", False))
+                    else None
+                )
+                selected_checkpoint_variant = "best_ema_single" if ema is not None else "best_single"
                 pin_memory = bool(runtime_cfg.get("pin_memory", True)) and device.type == "cuda"
                 train_loader = build_loader(
                     AIFPlusWindowDataset(
@@ -1138,6 +1320,7 @@ def main() -> None:
 
                 train_info = fit_aif_plus_best_single(
                     model=model,
+                    ema=ema,
                     train_loader=train_loader,
                     val_rows=val_rows,
                     dataset_bundle=dataset_bundle,
@@ -1163,7 +1346,7 @@ def main() -> None:
                         "train_view_name": experiment_meta["train_view_name"],
                         "eval_view_name": "val",
                         "seed": seed,
-                        "checkpoint_variant": "best_single",
+                        "checkpoint_variant": selected_checkpoint_variant,
                     },
                 )
 
@@ -1281,6 +1464,7 @@ def main() -> None:
                     )
                 del train_info
                 del train_loader
+                del ema
                 del model
                 gc.collect()
                 if torch.cuda.is_available():
