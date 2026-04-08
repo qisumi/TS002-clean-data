@@ -23,6 +23,8 @@ class AIFPlusConfig:
     n_decoder_layers: int = 2
     ffn_ratio: int = 4
     use_diff_branch: bool = True
+    use_channel_context: bool = True
+    use_residual_branch: bool = True
 
     patch_len_small: int = 8
     patch_stride_small: int = 4
@@ -205,6 +207,28 @@ class ChannelContext(nn.Module):
         state = self.state_proj(x_aug.reshape(-1, x_aug.shape[-1]))
         return {
             "x_aug": x_aug.permute(0, 2, 1),
+            "state": state,
+        }
+
+
+class ChannelStateEncoder(nn.Module):
+    """Strictly channel-independent context encoder."""
+
+    def __init__(self, seq_len: int, d_model: int, dropout: float) -> None:
+        super().__init__()
+        self.state_proj = nn.Sequential(
+            nn.LayerNorm(seq_len),
+            nn.Linear(seq_len, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, x_norm: torch.Tensor) -> dict[str, torch.Tensor]:
+        x_bc = x_norm.permute(0, 2, 1)
+        state = self.state_proj(x_bc.reshape(-1, x_bc.shape[-1]))
+        return {
+            "x_aug": x_norm,
             "state": state,
         }
 
@@ -550,12 +574,11 @@ class AIFPlusLoss(nn.Module):
 
 class AIFPlus(nn.Module):
     """
-    AIF-Plus-V4
-    - channel-independent clean trunk
+    AIF-Plus clean-first trunk
     - multi-patch + periodic + spectral tokens
     - horizon-query decoder
-    - tiny per-channel residual branch
-    - no adversarial / pair / CVaR / reconstruction losses by default
+    - optional explicit channel context
+    - optional tiny per-channel residual branch
     """
 
     def __init__(self, config: AIFPlusConfig) -> None:
@@ -565,6 +588,8 @@ class AIFPlus(nn.Module):
         self.pred_len = int(config.pred_len)
         self.n_vars = int(config.enc_in)
         self.use_diff_branch = bool(config.use_diff_branch)
+        self.use_channel_context = bool(config.use_channel_context)
+        self.use_residual_branch = bool(config.use_residual_branch)
 
         self.revin = RevIN(num_features=self.n_vars, affine=True, eps=config.eps)
 
@@ -573,12 +598,19 @@ class AIFPlus(nn.Module):
         self.bc_chunk_size = max(int(config.bc_chunk_size), 0)
         self.summary_type_embed = nn.Parameter(torch.zeros(1, 4, int(config.d_model)))
 
-        self.channel_context = ChannelContext(
-            seq_len=config.seq_len,
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            dropout=config.dropout,
-        )
+        if self.use_channel_context:
+            self.channel_context = ChannelContext(
+                seq_len=config.seq_len,
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                dropout=config.dropout,
+            )
+        else:
+            self.channel_context = ChannelStateEncoder(
+                seq_len=config.seq_len,
+                d_model=config.d_model,
+                dropout=config.dropout,
+            )
         self.encoder = MultiPatchCIEncoder(config=config, feature_dim=self.feature_dim)
         self.periodic = PeriodicTokenEncoder(
             d_model=config.d_model,
@@ -609,10 +641,14 @@ class AIFPlus(nn.Module):
             dropout=config.dropout,
             use_checkpointing=config.activation_checkpointing,
         )
-        self.residual = TinyResidualBranch(
-            config=config,
-            feature_dim=self.feature_dim,
-            task_dim=config.d_model,
+        self.residual = (
+            TinyResidualBranch(
+                config=config,
+                feature_dim=self.feature_dim,
+                task_dim=config.d_model,
+            )
+            if self.use_residual_branch
+            else None
         )
 
     @staticmethod
@@ -745,12 +781,18 @@ class AIFPlus(nn.Module):
         pred_clean_norm_bc = clean_out["pred_clean"]
 
         mean_masked, std_masked = masked_stats
-        delta_norm = (x_raw - x_masked) / std_masked.clamp_min(self.config.eps)
-        delta_features = self._build_delta_features(delta_norm)
-        uncertainty_bc = uncertainty.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
-        residual_out = self.residual(delta_features=delta_features, uncertainty_series=uncertainty_bc, task_embed=task_embed)
-
-        pred_norm_bc = pred_clean_norm_bc + residual_out["gate"] * residual_out["pred"]
+        if self.use_residual_branch and self.residual is not None:
+            delta_norm = (x_raw - x_masked) / std_masked.clamp_min(self.config.eps)
+            delta_features = self._build_delta_features(delta_norm)
+            uncertainty_bc = uncertainty.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
+            residual_out = self.residual(delta_features=delta_features, uncertainty_series=uncertainty_bc, task_embed=task_embed)
+            residual_gate = residual_out["gate"]
+            residual_term_bc = residual_out["gate"] * residual_out["pred"]
+            pred_norm_bc = pred_clean_norm_bc + residual_term_bc
+        else:
+            residual_gate = pred_clean_norm_bc.new_zeros((pred_clean_norm_bc.shape[0], 1))
+            residual_term_bc = pred_clean_norm_bc.new_zeros(pred_clean_norm_bc.shape)
+            pred_norm_bc = pred_clean_norm_bc
 
         pred_norm = pred_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
 
@@ -759,7 +801,7 @@ class AIFPlus(nn.Module):
             return {"pred": pred}
 
         pred_clean_norm = pred_clean_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
-        residual_norm = (residual_out["gate"] * residual_out["pred"]).view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+        residual_norm = residual_term_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
         pred_clean = self.revin.denormalize(pred_clean_norm, masked_stats)
         residual = residual_norm * std_masked
 
@@ -767,7 +809,7 @@ class AIFPlus(nn.Module):
             "pred": pred,
             "pred_clean": pred_clean,
             "pred_residual": residual,
-            "lambda_res": residual_out["gate"].view(x_raw.shape[0], self.n_vars),
+            "lambda_res": residual_gate.view(x_raw.shape[0], self.n_vars),
             "branch_weights": clean_out["branch_weights"].view(x_raw.shape[0], self.n_vars, 2),
             "task_embed": task_embed.view(x_raw.shape[0], self.n_vars, -1),
         }

@@ -558,6 +558,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--support-summary", default=str(Path("reports") / "clean_view_support_summary.csv"))
     parser.add_argument("--baseline-results", default=str(Path("results") / "counterfactual_2x2.csv"))
     parser.add_argument("--results-out", default=str(Path("results") / "aif_plus_results.csv"))
+    parser.add_argument("--results-online-out", default="")
+    parser.add_argument("--validity-out", default="")
     parser.add_argument("--window-errors-out", default=str(Path("results") / "aif_plus_window_errors.csv"))
     parser.add_argument("--arg-out", default=str(Path("results") / "aif_plus_artifact_reliance_gap.csv"))
     parser.add_argument("--wgr-out", default=str(Path("results") / "aif_plus_worst_group_risk.csv"))
@@ -745,13 +747,20 @@ def evaluate_aif_plus(
     }
 
 
-def select_validation_rows(view_df: pd.DataFrame, clean_view_name: str, max_rows: int | None) -> pd.DataFrame:
+def select_validation_rows(
+    view_df: pd.DataFrame,
+    clean_view_name: str,
+    max_rows: int | None,
+    min_clean_val_windows: int = 1,
+) -> pd.DataFrame:
     clean_val = select_view_rows(view_df, split_name="val", view_name=clean_view_name, max_rows=max_rows)
-    if not clean_val.empty:
+    if len(clean_val) >= max(int(min_clean_val_windows), 1):
         return clean_val
     raw_val = select_view_rows(view_df, split_name="val", view_name="raw", max_rows=max_rows)
     if not raw_val.empty:
         return raw_val
+    if not clean_val.empty:
+        return clean_val
     return select_view_rows(view_df, split_name="train", view_name=clean_view_name, max_rows=max_rows)
 
 
@@ -820,6 +829,8 @@ def build_model_config(
         n_decoder_layers=int(model_cfg.get("n_decoder_layers", 2)),
         ffn_ratio=int(model_cfg.get("ffn_ratio", 4)),
         use_diff_branch=bool(model_cfg.get("use_diff_branch", n_vars > 8)),
+        use_channel_context=bool(model_cfg.get("use_channel_context", True)),
+        use_residual_branch=bool(model_cfg.get("use_residual_branch", True)),
         patch_len_small=patch_len_small,
         patch_stride_small=patch_stride_small,
         patch_len_large=patch_len_large,
@@ -1147,6 +1158,107 @@ def make_val_debug_window_error_path(window_errors_out: Path | None) -> Path | N
     return window_errors_out.with_name(f"{window_errors_out.stem}_val_debug{window_errors_out.suffix}")
 
 
+def resolve_results_side_outputs(
+    results_out: Path | None,
+    results_online_out: Path | None,
+    validity_out: Path | None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    final_results_out = results_out
+    online_out = results_online_out
+    diagnostics_out = validity_out
+
+    if online_out is None and final_results_out is not None:
+        stem = final_results_out.stem
+        suffix = final_results_out.suffix
+        if stem.endswith("_results_online"):
+            online_out = final_results_out
+            final_results_out = final_results_out.with_name(f"{stem[:-7]}{suffix}")
+        else:
+            online_out = final_results_out.with_name(f"{stem}_online{suffix}")
+
+    if diagnostics_out is None and final_results_out is not None:
+        diagnostics_out = final_results_out.with_name(f"{final_results_out.stem}_validity_diagnostics{final_results_out.suffix}")
+
+    return final_results_out, online_out, diagnostics_out
+
+
+def recompute_results_from_window_errors(
+    online_results_df: pd.DataFrame,
+    window_errors_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if online_results_df.empty:
+        return online_results_df.copy(), pd.DataFrame()
+
+    metrics_cols = [col for col in ["mae", "mse", "smape"] if col in window_errors_df.columns]
+    if window_errors_df.empty or not metrics_cols:
+        diagnostics = online_results_df.copy()
+        if "n_eval_windows" in diagnostics.columns:
+            diagnostics["n_total_windows"] = diagnostics["n_eval_windows"]
+        diagnostics["n_valid_windows"] = diagnostics.get("n_total_windows", 0)
+        diagnostics["n_invalid_windows"] = 0
+        diagnostics["invalid_ratio"] = 0.0
+        return sort_results_frame(online_results_df.copy()), sort_results_frame(diagnostics)
+
+    valid_mask = np.ones(len(window_errors_df), dtype=bool)
+    for col in metrics_cols:
+        valid_mask &= np.isfinite(window_errors_df[col].to_numpy())
+    if "is_valid_metric" in window_errors_df.columns:
+        valid_mask &= window_errors_df["is_valid_metric"].fillna(0).astype(int).to_numpy().astype(bool)
+    filtered = window_errors_df.loc[valid_mask].copy()
+
+    key_cols = [
+        "dataset_name",
+        "backbone",
+        "lookback",
+        "horizon",
+        "train_view_name",
+        "eval_view_name",
+        "seed",
+        "checkpoint_variant",
+    ]
+    present_keys = [col for col in key_cols if col in window_errors_df.columns and col in online_results_df.columns]
+    grouped_valid = (
+        filtered.groupby(present_keys, dropna=False)
+        .agg(
+            mae=("mae", "mean"),
+            mse=("mse", "mean"),
+            smape=("smape", "mean"),
+            n_valid_windows=("window_id", "size") if "window_id" in filtered.columns else ("mae", "size"),
+        )
+        .reset_index()
+    )
+    grouped_total = (
+        window_errors_df.groupby(present_keys, dropna=False)
+        .agg(
+            n_total_windows=("window_id", "size") if "window_id" in window_errors_df.columns else ("mae", "size"),
+        )
+        .reset_index()
+    )
+    diagnostics = grouped_total.merge(grouped_valid, on=present_keys, how="left")
+    diagnostics["n_valid_windows"] = diagnostics["n_valid_windows"].fillna(0).astype(int)
+    diagnostics["n_total_windows"] = diagnostics["n_total_windows"].fillna(0).astype(int)
+    diagnostics["n_invalid_windows"] = diagnostics["n_total_windows"] - diagnostics["n_valid_windows"]
+    diagnostics["invalid_ratio"] = np.where(
+        diagnostics["n_total_windows"] > 0,
+        diagnostics["n_invalid_windows"] / diagnostics["n_total_windows"],
+        np.nan,
+    )
+
+    meta_cols = [
+        col
+        for col in online_results_df.columns
+        if col not in {"mae", "mse", "smape", "n_total_windows", "n_valid_windows", "n_invalid_windows", "invalid_ratio"}
+    ]
+    final_results = online_results_df[meta_cols].merge(
+        diagnostics,
+        on=present_keys,
+        how="left",
+    )
+    if "n_eval_windows" in final_results.columns:
+        final_results["n_eval_windows"] = final_results["n_total_windows"].fillna(final_results["n_eval_windows"])
+    return sort_results_frame(final_results), sort_results_frame(diagnostics)
+
+
 def main() -> None:
     args = parse_args()
     args.results_out = with_run_tag(args.results_out, str(Path("results") / "aif_plus_results.csv"), args.run_tag)
@@ -1186,14 +1298,21 @@ def main() -> None:
     support_summary_path = ROOT_DIR / Path(args.support_summary)
     baseline_results_path = ROOT_DIR / Path(args.baseline_results)
     results_out = resolve_optional_output_path(args.results_out)
+    results_online_out = resolve_optional_output_path(args.results_online_out)
+    validity_out = resolve_optional_output_path(args.validity_out)
     window_errors_out = resolve_optional_output_path(args.window_errors_out)
     arg_out = resolve_optional_output_path(args.arg_out)
     wgr_out = resolve_optional_output_path(args.wgr_out)
     ri_out = resolve_optional_output_path(args.ri_out)
     report_out = resolve_optional_output_path(args.report_out)
     checkpoint_out = resolve_optional_output_path(args.checkpoint_comparison_out)
+    results_out, results_online_out, validity_out = resolve_results_side_outputs(results_out, results_online_out, validity_out)
     val_debug_window_errors_out = make_val_debug_window_error_path(window_errors_out) if args.debug_write_val_window_errors else None
-    output_paths = [path for path in [results_out, arg_out, wgr_out, ri_out, report_out, checkpoint_out] if path is not None]
+    output_paths = [
+        path
+        for path in [results_out, results_online_out, validity_out, arg_out, wgr_out, ri_out, report_out, checkpoint_out]
+        if path is not None
+    ]
     if args.write_window_errors and window_errors_out is not None:
         output_paths.append(window_errors_out)
     if val_debug_window_errors_out is not None:
@@ -1237,6 +1356,7 @@ def main() -> None:
                 view_df=view_df,
                 clean_view_name=clean_view_name,
                 max_rows=runtime_cfg.get("max_val_windows"),
+                min_clean_val_windows=int(runtime_cfg.get("min_clean_val_windows", 1)),
             )
             if train_rows.empty or val_rows.empty:
                 log_progress(f"skip dataset={dataset_name} L{lookback} H{horizon} due to empty train/val rows")
@@ -1475,14 +1595,27 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    results_df = sort_results_frame(pd.DataFrame(result_rows))
+    online_results_df = sort_results_frame(pd.DataFrame(result_rows))
     checkpoint_df = sort_results_frame(pd.DataFrame(checkpoint_rows))
+    window_errors_df = (
+        pd.read_csv(window_errors_out, low_memory=False)
+        if args.write_window_errors and window_errors_out is not None and window_errors_out.exists()
+        else pd.DataFrame()
+    )
+    results_df, validity_df = recompute_results_from_window_errors(online_results_df, window_errors_df)
     arg_df = compute_aif_arg_table(results_df) if arg_out is not None or report_out is not None else pd.DataFrame()
     ri_df = compute_aif_ri_table(results_df) if ri_out is not None or report_out is not None else pd.DataFrame()
-    wgr_df = compute_aif_wgr_table(pd.DataFrame()) if wgr_out is not None or report_out is not None else pd.DataFrame()
+    wgr_input = window_errors_df.copy()
+    if not wgr_input.empty and "is_valid_metric" in wgr_input.columns:
+        wgr_input = wgr_input[wgr_input["is_valid_metric"].fillna(0).astype(int) == 1].copy()
+    wgr_df = compute_aif_wgr_table(wgr_input) if wgr_out is not None or report_out is not None else pd.DataFrame()
 
+    if results_online_out is not None:
+        online_results_df.to_csv(results_online_out, index=False)
     if results_out is not None:
         results_df.to_csv(results_out, index=False)
+    if validity_out is not None:
+        validity_df.to_csv(validity_out, index=False)
     if checkpoint_out is not None:
         checkpoint_df.to_csv(checkpoint_out, index=False)
     if arg_out is not None:
@@ -1508,7 +1641,9 @@ def main() -> None:
                 summary_note=experiment_meta["summary_note"],
             ),
         )
-    log_progress(f"finished results_out={results_out} rows={len(results_df)}")
+    log_progress(
+        f"finished results_out={results_out} results_online_out={results_online_out} rows={len(results_df)}"
+    )
 
 
 if __name__ == "__main__":

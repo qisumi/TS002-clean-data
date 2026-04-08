@@ -1,0 +1,126 @@
+defaults:
+  experiment_name: AIF-Plus-V7
+  backbone_name: AIFPlusV7
+  train_view_name: aif_plus_v7
+  summary_title: AIF-Plus-V7 Summary
+  summary_note: 本轮采用 AIF-Plus-V7：single-stage clean-mainboard-first training；默认关闭 EMA / soup、显式跨通道 context、以及 residual correction branch；最终结果默认基于 finite window_errors.csv 自动重算。
+  datasets: [ETTh1, ETTh2, ETTm1, ETTm2, solar_AL, weather, exchange_rate, electricity]
+  horizons: [96, 192, 336, 720]
+  seeds: [0]
+  lookback: 96
+  use_dataset_presets: false
+  use_preset_lookback: false
+  prefer_config_model_over_presets: true
+  aux_label_mode: label_free_aux
+  view_alias:
+    ETTh1:
+      clean_like: clean_like
+    ETTh2:
+      clean_like: clean_like
+    ETTm1:
+      clean_like: clean_like
+    ETTm2:
+      clean_like: clean_like
+    solar_AL:
+      clean_like: balanced
+    weather:
+      clean_like: clean_like
+    exchange_rate:
+      clean_like: clean_like
+    electricity:
+      clean_like: natural_clean
+  model:
+    d_model: 256
+    dropout: 0.05
+    n_heads: 8
+    n_patch_layers: 2
+    n_decoder_layers: 2
+    ffn_ratio: 4
+    use_diff_branch: true
+    use_channel_context: false
+    use_residual_branch: false
+    patch_len_small: 8
+    patch_stride_small: 4
+    patch_len_large: 16
+    patch_stride_large: 8
+    patch_jitter: false
+    periods: [24, 48, 96]
+    queries_per_period: 2
+    spectral_topk: 8
+    residual_hidden: 32
+    lambda_res_max: 0.01
+    activation_checkpointing: true
+    bc_chunk_size: 1024
+  runtime:
+    device: auto
+    batch_size: 48
+    eval_batch_size: 96
+    epochs: 35
+    lr: 0.0002
+    weight_decay: 0.05
+    grad_clip: 1.0
+    warmup_ratio: 0.05
+    amp: true
+    pin_memory: true
+    num_workers: 0
+    patience: 8
+    use_ema: false
+    min_clean_val_windows: 256
+    max_train_windows: 12000
+    max_val_windows: 3000
+    max_test_windows:
+  loss:
+    mae_weight: 0.85
+    mse_weight: 0.15
+  dataset_overrides:
+    ETTh1:
+      model:
+        use_diff_branch: false
+        dropout: 0.03
+      runtime:
+        lr: 0.00015
+        epochs: 50
+        patience: 10
+        min_clean_val_windows: 256
+    ETTh2:
+      model:
+        use_residual_branch: false
+    ETTm1:
+      model:
+        use_residual_branch: true
+        lambda_res_max: 0.0075
+    ETTm2:
+      model:
+        use_residual_branch: false
+    exchange_rate:
+      model:
+        use_diff_branch: false
+        use_residual_branch: false
+    weather:
+      model:
+        use_diff_branch: false
+        d_model: 288
+        dropout: 0.03
+        spectral_topk: 8
+        use_residual_branch: false
+      runtime:
+        batch_size: 24
+        eval_batch_size: 48
+        lr: 0.00015
+        epochs: 50
+        patience: 12
+        min_clean_val_windows: 512
+    electricity:
+      model:
+        use_residual_branch: false
+      runtime:
+        batch_size: 16
+        eval_batch_size: 32
+    solar_AL:
+      model:
+        dropout: 0.1
+        use_residual_branch: true
+        lambda_res_max: 0.02
+      runtime:
+        batch_size: 24
+        eval_batch_size: 48

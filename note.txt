@@ -5,18 +5,30 @@ name="$(basename "$PWD")"; tar -C .. --exclude="$name/figures" --exclude="$name/
 tar -xzf 002-Does-dirty-data-hurting-research.tar.gz
 
 如果平台没有自动设置 CUDA_VISIBLE_DEVICES，再手工指定
+AIF+ V7 主跑
 conda activate zzq
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
 CONDA_ENV_NAME=zzq \
 PLAN_GPU_IDS=0,1,2,3,4,5,6,7 \
 PLAN_CPU_CORES=24 \
 PLAN_DATALOADER_WORKERS_PER_PROC=2 \
-bash plan/012-run-aif-plus-v4.sh
+bash plan/015-run-aif-plus-v7.sh
 
 
+AIF+ V6 对照
+conda activate zzq
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+CONDA_ENV_NAME=zzq \
+PLAN_GPU_IDS=0,1,2,3,4,5,6,7 \
+PLAN_CPU_CORES=24 \
+PLAN_DATALOADER_WORKERS_PER_PROC=2 \
+bash plan/014-run-aif-plus-v6.sh
+
+
+AIF+ V4 双卡小跑
 conda activate zzq
 CONDA_ENV_NAME=zzq \
 PLAN_GPU_IDS=0,1 \
 PLAN_CPU_CORES=8 \
 PLAN_DATALOADER_WORKERS_PER_PROC=4 \
-bash plan/010-run-all.sh
+bash plan/012-run-aif-plus-v4.sh
