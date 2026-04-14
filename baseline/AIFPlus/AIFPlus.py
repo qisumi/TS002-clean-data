@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,6 +24,15 @@ class AIFPlusConfig:
     use_diff_branch: bool = True
     use_channel_context: bool = True
     use_residual_branch: bool = True
+
+    # V8 small-clean controls
+    use_linear_head: bool = False
+    use_periodic_branch: bool = True
+    use_frequency_branch: bool = True
+    use_state_channel_mixer: bool = False
+    state_channel_heads: int = 4
+    deep_residual_max: float = 1.0
+    linear_head_use_last_value: bool = True
 
     patch_len_small: int = 8
     patch_stride_small: int = 4
@@ -133,7 +141,8 @@ class TransformerBlock(nn.Module):
         self.drop_path2 = StochasticDepth(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+        attn_in = self.norm1(x)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         x = x + self.drop_path1(attn_out)
         x = x + self.drop_path2(self.ffn(self.norm2(x)))
         return x
@@ -205,10 +214,7 @@ class ChannelContext(nn.Module):
         ctx = self.mix(ctx)
         x_aug = x_bc + ctx
         state = self.state_proj(x_aug.reshape(-1, x_aug.shape[-1]))
-        return {
-            "x_aug": x_aug.permute(0, 2, 1),
-            "state": state,
-        }
+        return {"x_aug": x_aug.permute(0, 2, 1), "state": state}
 
 
 class ChannelStateEncoder(nn.Module):
@@ -227,10 +233,7 @@ class ChannelStateEncoder(nn.Module):
     def forward(self, x_norm: torch.Tensor) -> dict[str, torch.Tensor]:
         x_bc = x_norm.permute(0, 2, 1)
         state = self.state_proj(x_bc.reshape(-1, x_bc.shape[-1]))
-        return {
-            "x_aug": x_norm,
-            "state": state,
-        }
+        return {"x_aug": x_norm, "state": state}
 
 
 class PatchBranch(nn.Module):
@@ -327,7 +330,7 @@ class PeriodicTokenEncoder(nn.Module):
         self.queries_per_period = int(max(1, queries_per_period))
         self.use_checkpointing = bool(use_checkpointing)
         self.query_bank = nn.Parameter(torch.zeros(1, self.queries_per_period, self.d_model))
-        self.period_embed = nn.Embedding(len(self.periods), self.d_model)
+        self.period_embed = nn.Embedding(max(len(self.periods), 1), self.d_model)
         self.layers = nn.ModuleList(
             [
                 CrossAttentionBlock(
@@ -348,15 +351,18 @@ class PeriodicTokenEncoder(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def _build_queries(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def _build_queries(self, batch_size: int) -> torch.Tensor:
         queries = []
         for idx, _ in enumerate(self.periods):
             base = self.query_bank.expand(batch_size, -1, -1)
             queries.append(base + self.period_embed.weight[idx].view(1, 1, -1))
+        if not queries:
+            base = self.query_bank.expand(batch_size, -1, -1)
+            queries.append(base)
         return torch.cat(queries, dim=1)
 
     def forward(self, patch_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
-        queries = self._build_queries(batch_size=patch_tokens.shape[0], device=patch_tokens.device)
+        queries = self._build_queries(batch_size=patch_tokens.shape[0])
         queries = queries + self.type_embed
         for layer in self.layers:
             queries = _apply_with_checkpoint(layer, queries, patch_tokens, enabled=self.use_checkpointing)
@@ -559,6 +565,83 @@ class TinyResidualBranch(nn.Module):
         return {"pred": pred, "gate": gate, "state": state}
 
 
+class SharedNLinearHead(nn.Module):
+    """Channel-independent direct head, strong on small clean datasets."""
+
+    def __init__(self, seq_len: int, pred_len: int, use_last_value: bool = True) -> None:
+        super().__init__()
+        self.seq_len = int(seq_len)
+        self.pred_len = int(pred_len)
+        self.use_last_value = bool(use_last_value)
+        self.linear = nn.Linear(self.seq_len, self.pred_len)
+
+    def forward(self, series_bc: torch.Tensor) -> torch.Tensor:
+        if self.use_last_value:
+            anchor = series_bc[:, -1:].detach()
+            centered = series_bc - anchor
+            pred = self.linear(centered) + anchor
+            return pred
+        return self.linear(series_bc)
+
+
+class TinyStateChannelMixer(nn.Module):
+    """Lightweight channel interaction over per-channel states, not full sequences."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=_compatible_heads(n_heads, d_model),
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward(d_model, d_model * 2, dropout)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, max(d_model // 2, 32)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(d_model // 2, 32), 1),
+        )
+
+    def forward(self, state_bc: torch.Tensor, batch_size: int, n_vars: int) -> torch.Tensor:
+        states = state_bc.view(batch_size, n_vars, -1)
+        attn_in = self.norm1(states)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        mixed = states + attn_out
+        mixed = mixed + self.ffn(self.norm2(mixed))
+        alpha = torch.sigmoid(self.gate(torch.cat([states, mixed], dim=-1)))
+        out = states + alpha * (mixed - states)
+        return out.reshape(batch_size * n_vars, -1)
+
+
+class DeepResidualGate(nn.Module):
+    def __init__(self, d_model: int, task_dim: int, dropout: float, max_scale: float) -> None:
+        super().__init__()
+        self.max_scale = float(max(max_scale, 0.0))
+        hidden = max(d_model // 2, 32)
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model + task_dim),
+            nn.Linear(d_model + task_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        # Start with the deep branch as a small correction on top of the linear head.
+        final_linear = self.net[-1]
+        if isinstance(final_linear, nn.Linear):
+            nn.init.zeros_(final_linear.weight)
+            nn.init.constant_(final_linear.bias, -2.0)
+
+    def forward(self, deep_state: torch.Tensor, task_embed: torch.Tensor) -> torch.Tensor:
+        if self.max_scale <= 0.0:
+            return deep_state.new_zeros((deep_state.shape[0], 1))
+        gate = torch.sigmoid(self.net(torch.cat([deep_state, task_embed], dim=-1)))
+        return gate * self.max_scale
+
+
 class AIFPlusLoss(nn.Module):
     def __init__(self, mae_weight: float = 0.7, mse_weight: float = 0.3) -> None:
         super().__init__()
@@ -574,11 +657,12 @@ class AIFPlusLoss(nn.Module):
 
 class AIFPlus(nn.Module):
     """
-    AIF-Plus clean-first trunk
-    - multi-patch + periodic + spectral tokens
-    - horizon-query decoder
-    - optional explicit channel context
-    - optional tiny per-channel residual branch
+    AIF-Plus-V8
+    - keeps the clean-first V7 training/eval philosophy
+    - adds an optional NLinear-style direct head for small clean datasets
+    - deep token model becomes a residual corrector on top of the direct head
+    - optional lightweight channel-state mixer (useful for tiny multivariate datasets such as exchange_rate)
+    - periodic/frequency branches can be disabled dataset-wise to reduce over-parameterization
     """
 
     def __init__(self, config: AIFPlusConfig) -> None:
@@ -590,13 +674,15 @@ class AIFPlus(nn.Module):
         self.use_diff_branch = bool(config.use_diff_branch)
         self.use_channel_context = bool(config.use_channel_context)
         self.use_residual_branch = bool(config.use_residual_branch)
+        self.use_linear_head = bool(config.use_linear_head)
+        self.use_periodic_branch = bool(config.use_periodic_branch)
+        self.use_frequency_branch = bool(config.use_frequency_branch)
+        self.use_state_channel_mixer = bool(config.use_state_channel_mixer)
+        self.bc_chunk_size = max(int(config.bc_chunk_size), 0)
 
         self.revin = RevIN(num_features=self.n_vars, affine=True, eps=config.eps)
-
         self.task_embed = nn.Embedding(max(int(config.horizon_vocab_size), 1), int(config.d_model))
         self.feature_dim = 2 if self.use_diff_branch else 1
-        self.bc_chunk_size = max(int(config.bc_chunk_size), 0)
-        self.summary_type_embed = nn.Parameter(torch.zeros(1, 4, int(config.d_model)))
 
         if self.use_channel_context:
             self.channel_context = ChannelContext(
@@ -611,24 +697,46 @@ class AIFPlus(nn.Module):
                 d_model=config.d_model,
                 dropout=config.dropout,
             )
+
         self.encoder = MultiPatchCIEncoder(config=config, feature_dim=self.feature_dim)
-        self.periodic = PeriodicTokenEncoder(
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            periods=config.periods,
-            queries_per_period=config.queries_per_period,
-            n_layers=1,
-            ffn_ratio=config.ffn_ratio,
-            dropout=config.dropout,
-            use_checkpointing=config.activation_checkpointing,
+        self.periodic = (
+            PeriodicTokenEncoder(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                periods=config.periods,
+                queries_per_period=config.queries_per_period,
+                n_layers=1,
+                ffn_ratio=config.ffn_ratio,
+                dropout=config.dropout,
+                use_checkpointing=config.activation_checkpointing,
+            )
+            if self.use_periodic_branch
+            else None
         )
-        self.frequency = FrequencyTokenEncoder(
-            d_model=config.d_model,
-            topk=config.spectral_topk,
-            dropout=config.dropout,
+        self.frequency = (
+            FrequencyTokenEncoder(
+                d_model=config.d_model,
+                topk=config.spectral_topk,
+                dropout=config.dropout,
+            )
+            if self.use_frequency_branch
+            else None
         )
+        self.state_channel_mixer = (
+            TinyStateChannelMixer(
+                d_model=config.d_model,
+                n_heads=config.state_channel_heads,
+                dropout=config.dropout,
+            )
+            if self.use_state_channel_mixer
+            else None
+        )
+
+        summary_tokens = 2 + int(self.use_periodic_branch) + int(self.use_frequency_branch)
+        self.summary_type_embed = nn.Parameter(torch.zeros(1, summary_tokens, int(config.d_model)))
+        global_state_inputs = 3 + int(self.use_periodic_branch) + int(self.use_frequency_branch)
         self.global_state = ChannelMLP(
-            in_dim=config.d_model * 5,
+            in_dim=config.d_model * global_state_inputs,
             out_dim=config.d_model,
             dropout=config.dropout,
         )
@@ -640,6 +748,25 @@ class AIFPlus(nn.Module):
             ffn_ratio=config.ffn_ratio,
             dropout=config.dropout,
             use_checkpointing=config.activation_checkpointing,
+        )
+        self.linear_head = (
+            SharedNLinearHead(
+                seq_len=config.seq_len,
+                pred_len=config.pred_len,
+                use_last_value=config.linear_head_use_last_value,
+            )
+            if self.use_linear_head
+            else None
+        )
+        self.deep_gate = (
+            DeepResidualGate(
+                d_model=config.d_model,
+                task_dim=config.d_model,
+                dropout=config.dropout,
+                max_scale=config.deep_residual_max,
+            )
+            if self.use_linear_head
+            else None
         )
         self.residual = (
             TinyResidualBranch(
@@ -658,12 +785,11 @@ class AIFPlus(nn.Module):
         return torch.cat([pad, diff], dim=1)
 
     def _build_clean_features(self, x_norm: torch.Tensor) -> torch.Tensor:
-        # [B, L, C] -> [B*C, F, L]
         features = [x_norm.permute(0, 2, 1).unsqueeze(2)]
         if self.use_diff_branch:
             diff = self._first_difference(x_norm).permute(0, 2, 1).unsqueeze(2)
             features.append(diff)
-        feat = torch.cat(features, dim=2)  # [B, C, F, L]
+        feat = torch.cat(features, dim=2)
         return feat.reshape(x_norm.shape[0] * x_norm.shape[2], feat.shape[2], x_norm.shape[1])
 
     def _build_delta_features(self, delta_norm: torch.Tensor) -> torch.Tensor:
@@ -677,19 +803,24 @@ class AIFPlus(nn.Module):
     def _expand_task_embed(self, horizon_id: torch.Tensor) -> torch.Tensor:
         if horizon_id.ndim == 0:
             horizon_id = horizon_id.view(1)
-        task = self.task_embed(horizon_id)  # [B, D]
+        task = self.task_embed(horizon_id)
         task = task.unsqueeze(1).expand(-1, self.n_vars, -1)
         return task.reshape(task.shape[0] * task.shape[1], task.shape[2])
 
     def _build_summary_tokens(
         self,
         enc_state: torch.Tensor,
-        period_state: torch.Tensor,
-        freq_state: torch.Tensor,
         channel_state: torch.Tensor,
+        period_state: torch.Tensor | None,
+        freq_state: torch.Tensor | None,
     ) -> torch.Tensor:
-        summary = torch.stack([enc_state, period_state, freq_state, channel_state], dim=1)
-        return summary + self.summary_type_embed
+        states = [enc_state, channel_state]
+        if period_state is not None:
+            states.append(period_state)
+        if freq_state is not None:
+            states.append(freq_state)
+        summary = torch.stack(states, dim=1)
+        return summary + self.summary_type_embed[:, : summary.shape[1], :]
 
     def _run_clean_trunk(
         self,
@@ -697,11 +828,16 @@ class AIFPlus(nn.Module):
         masked_series_bc: torch.Tensor,
         task_embed: torch.Tensor,
         channel_state_bc: torch.Tensor,
+        batch_size: int,
         return_aux: bool,
     ) -> dict[str, torch.Tensor]:
         total = int(clean_features.shape[0])
         chunk_size = total if self.bc_chunk_size <= 0 else min(self.bc_chunk_size, total)
-        pred_clean_chunks: list[torch.Tensor] = []
+        if self.use_state_channel_mixer:
+            chunk_size = total
+
+        pred_deep_chunks: list[torch.Tensor] = []
+        global_state_chunks: list[torch.Tensor] = []
         branch_weight_chunks: list[torch.Tensor] | None = [] if return_aux else None
 
         for start in range(0, total, chunk_size):
@@ -711,35 +847,36 @@ class AIFPlus(nn.Module):
                 task_embed=task_embed[start:end],
                 patch_jitter=bool(self.config.patch_jitter),
             )
-            period_state = self.periodic(enc["tokens_main"])["state"]
-            freq_state = self.frequency(masked_series_bc[start:end])["state"]
+            enc_state = enc["state"]
+            if self.state_channel_mixer is not None:
+                local_count = end - start
+                local_batch = max(local_count // self.n_vars, 1)
+                enc_state = self.state_channel_mixer(enc_state, batch_size=local_batch, n_vars=self.n_vars)
+
+            period_state = self.periodic(enc["tokens_main"])["state"] if self.periodic is not None else None
+            freq_state = self.frequency(masked_series_bc[start:end])["state"] if self.frequency is not None else None
             summary_tokens = self._build_summary_tokens(
-                enc_state=enc["state"],
+                enc_state=enc_state,
+                channel_state=channel_state_bc[start:end],
                 period_state=period_state,
                 freq_state=freq_state,
-                channel_state=channel_state_bc[start:end],
             )
             token_bank = torch.cat([enc["tokens_main"], summary_tokens], dim=1)
-            global_state = self.global_state(
-                torch.cat(
-                    [
-                        enc["state"],
-                        period_state,
-                        freq_state,
-                        channel_state_bc[start:end],
-                        task_embed[start:end],
-                    ],
-                    dim=-1,
-                )
-            )
-            pred_clean_chunks.append(
-                self.decoder(token_bank=token_bank, global_state=global_state, task_embed=task_embed[start:end])
-            )
+            global_inputs = [enc_state, channel_state_bc[start:end], task_embed[start:end]]
+            if period_state is not None:
+                global_inputs.append(period_state)
+            if freq_state is not None:
+                global_inputs.append(freq_state)
+            global_state = self.global_state(torch.cat(global_inputs, dim=-1))
+            pred_deep = self.decoder(token_bank=token_bank, global_state=global_state, task_embed=task_embed[start:end])
+            pred_deep_chunks.append(pred_deep)
+            global_state_chunks.append(global_state)
             if branch_weight_chunks is not None:
                 branch_weight_chunks.append(enc["branch_weights"])
 
         outputs = {
-            "pred_clean": torch.cat(pred_clean_chunks, dim=0),
+            "pred_deep": torch.cat(pred_deep_chunks, dim=0),
+            "global_state": torch.cat(global_state_chunks, dim=0),
         }
         if branch_weight_chunks is not None:
             outputs["branch_weights"] = torch.cat(branch_weight_chunks, dim=0)
@@ -763,6 +900,7 @@ class AIFPlus(nn.Module):
         if horizon_id.ndim == 0:
             horizon_id = horizon_id.view(1).expand(x_raw.shape[0])
 
+        batch_size = int(x_raw.shape[0])
         masked_norm, masked_stats = self.revin.normalize(x_masked)
         channel_context = self.channel_context(masked_norm)
         masked_aug = channel_context["x_aug"]
@@ -770,48 +908,66 @@ class AIFPlus(nn.Module):
 
         clean_features = self._build_clean_features(masked_aug)
         task_embed = self._expand_task_embed(horizon_id)
-        masked_series_bc = masked_aug.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
+        masked_series_bc = masked_aug.permute(0, 2, 1).reshape(batch_size * self.n_vars, self.seq_len)
+        masked_norm_bc = masked_norm.permute(0, 2, 1).reshape(batch_size * self.n_vars, self.seq_len)
+
         clean_out = self._run_clean_trunk(
             clean_features=clean_features,
             masked_series_bc=masked_series_bc,
             task_embed=task_embed,
             channel_state_bc=channel_state_bc,
+            batch_size=batch_size,
             return_aux=return_aux,
         )
-        pred_clean_norm_bc = clean_out["pred_clean"]
+        pred_deep_norm_bc = clean_out["pred_deep"]
+        if self.linear_head is not None and self.deep_gate is not None:
+            pred_linear_norm_bc = self.linear_head(masked_norm_bc)
+            deep_gate = self.deep_gate(clean_out["global_state"], task_embed)
+            pred_clean_norm_bc = pred_linear_norm_bc + deep_gate * pred_deep_norm_bc
+        else:
+            pred_linear_norm_bc = pred_deep_norm_bc.new_zeros(pred_deep_norm_bc.shape)
+            deep_gate = pred_deep_norm_bc.new_ones((pred_deep_norm_bc.shape[0], 1))
+            pred_clean_norm_bc = pred_deep_norm_bc
 
         mean_masked, std_masked = masked_stats
         if self.use_residual_branch and self.residual is not None:
             delta_norm = (x_raw - x_masked) / std_masked.clamp_min(self.config.eps)
             delta_features = self._build_delta_features(delta_norm)
-            uncertainty_bc = uncertainty.permute(0, 2, 1).reshape(x_raw.shape[0] * self.n_vars, self.seq_len)
+            uncertainty_bc = uncertainty.permute(0, 2, 1).reshape(batch_size * self.n_vars, self.seq_len)
             residual_out = self.residual(delta_features=delta_features, uncertainty_series=uncertainty_bc, task_embed=task_embed)
             residual_gate = residual_out["gate"]
-            residual_term_bc = residual_out["gate"] * residual_out["pred"]
+            residual_term_bc = residual_gate * residual_out["pred"]
             pred_norm_bc = pred_clean_norm_bc + residual_term_bc
         else:
             residual_gate = pred_clean_norm_bc.new_zeros((pred_clean_norm_bc.shape[0], 1))
             residual_term_bc = pred_clean_norm_bc.new_zeros(pred_clean_norm_bc.shape)
             pred_norm_bc = pred_clean_norm_bc
 
-        pred_norm = pred_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
-
+        pred_norm = pred_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
         pred = self.revin.denormalize(pred_norm, masked_stats)
         if not return_aux:
             return {"pred": pred}
 
-        pred_clean_norm = pred_clean_norm_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
-        residual_norm = residual_term_bc.view(x_raw.shape[0], self.n_vars, self.pred_len).transpose(1, 2)
+        pred_clean_norm = pred_clean_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
+        pred_deep_norm = pred_deep_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
+        pred_linear_norm = pred_linear_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
+        residual_norm = residual_term_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
+
         pred_clean = self.revin.denormalize(pred_clean_norm, masked_stats)
+        pred_deep = pred_deep_norm * std_masked + mean_masked
+        pred_linear = pred_linear_norm * std_masked + mean_masked
         residual = residual_norm * std_masked
 
         return {
             "pred": pred,
             "pred_clean": pred_clean,
+            "pred_deep": pred_deep,
+            "pred_linear": pred_linear,
             "pred_residual": residual,
-            "lambda_res": residual_gate.view(x_raw.shape[0], self.n_vars),
-            "branch_weights": clean_out["branch_weights"].view(x_raw.shape[0], self.n_vars, 2),
-            "task_embed": task_embed.view(x_raw.shape[0], self.n_vars, -1),
+            "lambda_res": residual_gate.view(batch_size, self.n_vars),
+            "lambda_deep": deep_gate.view(batch_size, self.n_vars),
+            "branch_weights": clean_out.get("branch_weights", pred_clean_norm_bc.new_zeros((batch_size * self.n_vars, 2))).view(batch_size, self.n_vars, 2),
+            "task_embed": task_embed.view(batch_size, self.n_vars, -1),
         }
 
     @torch.no_grad()
