@@ -25,14 +25,31 @@ class AIFPlusConfig:
     use_channel_context: bool = True
     use_residual_branch: bool = True
 
-    # V8 small-clean controls
+    # Small-clean controls
     use_linear_head: bool = False
+    direct_head_type: str = "shared_linear"  # shared_linear | decomp_linear
     use_periodic_branch: bool = True
     use_frequency_branch: bool = True
     use_state_channel_mixer: bool = False
     state_channel_heads: int = 4
     deep_residual_max: float = 1.0
     linear_head_use_last_value: bool = True
+
+    # Optional adaptive direct head (LGPred-lite)
+    use_adaptive_linear_basis: bool = False
+    adaptive_basis_rank: int = 4
+    adaptive_basis_hidden: int = 64
+    adaptive_basis_max: float = 0.25
+
+    # Optional local temporal refiner (ModernTCN-lite)
+    use_local_refiner: bool = False
+    local_refiner_hidden: int = 32
+    local_refiner_kernel_small: int = 3
+    local_refiner_kernel_large: int = 7
+    local_residual_max: float = 0.15
+
+    # Direct-head decomposition
+    decomp_kernel_size: int = 25
 
     patch_len_small: int = 8
     patch_stride_small: int = 4
@@ -584,6 +601,139 @@ class SharedNLinearHead(nn.Module):
         return self.linear(series_bc)
 
 
+class MovingAverageDecomposition(nn.Module):
+    def __init__(self, kernel_size: int) -> None:
+        super().__init__()
+        kernel_size = max(int(kernel_size), 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+
+    def forward(self, series_bc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        trend = F.avg_pool1d(series_bc.unsqueeze(1), kernel_size=self.kernel_size, stride=1, padding=self.pad)
+        trend = trend.squeeze(1)
+        season = series_bc - trend
+        return season, trend
+
+
+class DecompLinearHead(nn.Module):
+    """DLinear-style direct head with last-trend anchoring."""
+
+    def __init__(self, seq_len: int, pred_len: int, kernel_size: int = 25) -> None:
+        super().__init__()
+        self.decomp = MovingAverageDecomposition(kernel_size=kernel_size)
+        self.seasonal = nn.Linear(int(seq_len), int(pred_len))
+        self.trend = nn.Linear(int(seq_len), int(pred_len))
+
+    def forward(self, series_bc: torch.Tensor) -> torch.Tensor:
+        season, trend = self.decomp(series_bc)
+        trend_anchor = trend[:, -1:].detach()
+        trend_centered = trend - trend_anchor
+        return self.seasonal(season) + self.trend(trend_centered) + trend_anchor
+
+
+class AdaptiveBasisLinearHead(nn.Module):
+    """Low-rank adaptive linear correction inspired by predictor generation."""
+
+    def __init__(self, seq_len: int, pred_len: int, task_dim: int, d_model: int, rank: int, hidden: int, dropout: float, max_scale: float) -> None:
+        super().__init__()
+        self.pred_len = int(pred_len)
+        self.rank = max(int(rank), 0)
+        self.max_scale = float(max(max_scale, 0.0))
+        if self.rank <= 0 or self.max_scale <= 0.0:
+            self.register_parameter('basis', None)
+            self.net = None
+            return
+        self.basis = nn.Parameter(torch.empty(self.rank, self.pred_len, int(seq_len)))
+        nn.init.normal_(self.basis, mean=0.0, std=0.02)
+        hidden = max(int(hidden), self.rank)
+        self.net = nn.Sequential(
+            nn.LayerNorm(int(d_model) + int(task_dim)),
+            nn.Linear(int(d_model) + int(task_dim), hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, self.rank),
+        )
+        final_linear = self.net[-1]
+        if isinstance(final_linear, nn.Linear):
+            nn.init.zeros_(final_linear.weight)
+            nn.init.zeros_(final_linear.bias)
+
+    def forward(self, series_bc: torch.Tensor, state_bc: torch.Tensor, task_embed: torch.Tensor) -> torch.Tensor:
+        if self.basis is None or self.net is None:
+            return series_bc.new_zeros((series_bc.shape[0], self.pred_len))
+        coeff = torch.tanh(self.net(torch.cat([state_bc, task_embed], dim=-1))) * self.max_scale
+        basis_out = torch.einsum('bl,rpl->brp', series_bc, self.basis)
+        return torch.einsum('br,brp->bp', coeff, basis_out)
+
+
+class LocalTemporalRefiner(nn.Module):
+    """Lightweight per-channel temporal conv refiner for clean small datasets."""
+
+    def __init__(self, pred_len: int, task_dim: int, hidden: int, kernel_small: int, kernel_large: int, dropout: float, max_scale: float) -> None:
+        super().__init__()
+        self.pred_len = int(pred_len)
+        self.max_scale = float(max(max_scale, 0.0))
+        hidden = max(int(hidden), 8)
+        ks = max(int(kernel_small), 1)
+        kl = max(int(kernel_large), ks)
+        if ks % 2 == 0:
+            ks += 1
+        if kl % 2 == 0:
+            kl += 1
+        self.input_proj = nn.Conv1d(1, hidden, kernel_size=1)
+        self.dw_small = nn.Conv1d(hidden, hidden, kernel_size=ks, padding=ks // 2, groups=hidden)
+        self.dw_large = nn.Conv1d(hidden, hidden, kernel_size=kl, padding=kl // 2, groups=hidden)
+        self.mix = nn.Conv1d(hidden * 2, hidden, kernel_size=1)
+        self.norm = nn.BatchNorm1d(hidden)
+        self.dropout = nn.Dropout(dropout)
+        self.state_proj = nn.Sequential(
+            nn.LayerNorm(hidden * 2),
+            nn.Linear(hidden * 2, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        head_hidden = max(hidden * 2, 32)
+        self.pred_head = nn.Sequential(
+            nn.LayerNorm(hidden + task_dim),
+            nn.Linear(hidden + task_dim, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, self.pred_len),
+        )
+        self.gate_head = nn.Sequential(
+            nn.LayerNorm(hidden + task_dim),
+            nn.Linear(hidden + task_dim, head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
+        final_linear = self.gate_head[-1]
+        if isinstance(final_linear, nn.Linear):
+            nn.init.zeros_(final_linear.weight)
+            nn.init.constant_(final_linear.bias, -2.0)
+
+    def forward(self, series_bc: torch.Tensor, task_embed: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.max_scale <= 0.0:
+            zeros_pred = series_bc.new_zeros((series_bc.shape[0], self.pred_len))
+            zeros_gate = series_bc.new_zeros((series_bc.shape[0], 1))
+            zeros_state = series_bc.new_zeros((series_bc.shape[0], max(self.input_proj.out_channels, 1)))
+            return {'pred': zeros_pred, 'gate': zeros_gate, 'state': zeros_state}
+        x = self.input_proj(series_bc.unsqueeze(1))
+        xs = self.dw_small(x)
+        xl = self.dw_large(x)
+        x = torch.cat([xs, xl], dim=1)
+        x = F.gelu(self.mix(x))
+        x = self.norm(x)
+        x = self.dropout(x)
+        pooled = torch.cat([x.mean(dim=-1), x.amax(dim=-1)], dim=-1)
+        state = self.state_proj(pooled)
+        pred = self.pred_head(torch.cat([state, task_embed], dim=-1))
+        gate = torch.sigmoid(self.gate_head(torch.cat([state, task_embed], dim=-1))) * self.max_scale
+        return {'pred': pred, 'gate': gate, 'state': state}
+
+
 class TinyStateChannelMixer(nn.Module):
     """Lightweight channel interaction over per-channel states, not full sequences."""
 
@@ -657,12 +807,12 @@ class AIFPlusLoss(nn.Module):
 
 class AIFPlus(nn.Module):
     """
-    AIF-Plus-V8
-    - keeps the clean-first V7 training/eval philosophy
-    - adds an optional NLinear-style direct head for small clean datasets
-    - deep token model becomes a residual corrector on top of the direct head
-    - optional lightweight channel-state mixer (useful for tiny multivariate datasets such as exchange_rate)
-    - periodic/frequency branches can be disabled dataset-wise to reduce over-parameterization
+    AIF-Plus-V9
+    - preserves the V8 clean-first training/eval flow
+    - keeps CI as the default regime for benchmark-clean datasets
+    - upgrades the direct head for small clean datasets with decomposition + optional adaptive bases
+    - adds an optional ModernTCN-lite local temporal refiner for ETTh1-like datasets
+    - keeps channel interaction as a tiny state-level plugin, mainly for exchange_rate-like datasets
     """
 
     def __init__(self, config: AIFPlusConfig) -> None:
@@ -675,9 +825,12 @@ class AIFPlus(nn.Module):
         self.use_channel_context = bool(config.use_channel_context)
         self.use_residual_branch = bool(config.use_residual_branch)
         self.use_linear_head = bool(config.use_linear_head)
+        self.direct_head_type = str(config.direct_head_type).strip().lower()
         self.use_periodic_branch = bool(config.use_periodic_branch)
         self.use_frequency_branch = bool(config.use_frequency_branch)
         self.use_state_channel_mixer = bool(config.use_state_channel_mixer)
+        self.use_adaptive_linear_basis = bool(config.use_adaptive_linear_basis)
+        self.use_local_refiner = bool(config.use_local_refiner)
         self.bc_chunk_size = max(int(config.bc_chunk_size), 0)
 
         self.revin = RevIN(num_features=self.n_vars, affine=True, eps=config.eps)
@@ -749,13 +902,46 @@ class AIFPlus(nn.Module):
             dropout=config.dropout,
             use_checkpointing=config.activation_checkpointing,
         )
-        self.linear_head = (
-            SharedNLinearHead(
+        if self.use_linear_head:
+            if self.direct_head_type == 'decomp_linear':
+                self.linear_head = DecompLinearHead(
+                    seq_len=config.seq_len,
+                    pred_len=config.pred_len,
+                    kernel_size=config.decomp_kernel_size,
+                )
+            else:
+                self.linear_head = SharedNLinearHead(
+                    seq_len=config.seq_len,
+                    pred_len=config.pred_len,
+                    use_last_value=config.linear_head_use_last_value,
+                )
+        else:
+            self.linear_head = None
+        self.adaptive_linear_basis = (
+            AdaptiveBasisLinearHead(
                 seq_len=config.seq_len,
                 pred_len=config.pred_len,
-                use_last_value=config.linear_head_use_last_value,
+                task_dim=config.d_model,
+                d_model=config.d_model,
+                rank=config.adaptive_basis_rank,
+                hidden=config.adaptive_basis_hidden,
+                dropout=config.dropout,
+                max_scale=config.adaptive_basis_max,
             )
-            if self.use_linear_head
+            if self.use_linear_head and self.use_adaptive_linear_basis
+            else None
+        )
+        self.local_refiner = (
+            LocalTemporalRefiner(
+                pred_len=config.pred_len,
+                task_dim=config.d_model,
+                hidden=config.local_refiner_hidden,
+                kernel_small=config.local_refiner_kernel_small,
+                kernel_large=config.local_refiner_kernel_large,
+                dropout=config.dropout,
+                max_scale=config.local_residual_max,
+            )
+            if self.use_linear_head and self.use_local_refiner
             else None
         )
         self.deep_gate = (
@@ -922,10 +1108,26 @@ class AIFPlus(nn.Module):
         pred_deep_norm_bc = clean_out["pred_deep"]
         if self.linear_head is not None and self.deep_gate is not None:
             pred_linear_norm_bc = self.linear_head(masked_norm_bc)
+            if self.adaptive_linear_basis is not None:
+                pred_linear_norm_bc = pred_linear_norm_bc + self.adaptive_linear_basis(
+                    masked_norm_bc,
+                    clean_out["global_state"],
+                    task_embed,
+                )
+            if self.local_refiner is not None:
+                local_out = self.local_refiner(masked_norm_bc, task_embed)
+                local_gate = local_out["gate"]
+                pred_local_norm_bc = local_out["pred"]
+                pred_linear_norm_bc = pred_linear_norm_bc + local_gate * pred_local_norm_bc
+            else:
+                local_gate = pred_deep_norm_bc.new_zeros((pred_deep_norm_bc.shape[0], 1))
+                pred_local_norm_bc = pred_deep_norm_bc.new_zeros(pred_deep_norm_bc.shape)
             deep_gate = self.deep_gate(clean_out["global_state"], task_embed)
             pred_clean_norm_bc = pred_linear_norm_bc + deep_gate * pred_deep_norm_bc
         else:
             pred_linear_norm_bc = pred_deep_norm_bc.new_zeros(pred_deep_norm_bc.shape)
+            pred_local_norm_bc = pred_deep_norm_bc.new_zeros(pred_deep_norm_bc.shape)
+            local_gate = pred_deep_norm_bc.new_zeros((pred_deep_norm_bc.shape[0], 1))
             deep_gate = pred_deep_norm_bc.new_ones((pred_deep_norm_bc.shape[0], 1))
             pred_clean_norm_bc = pred_deep_norm_bc
 
@@ -951,11 +1153,13 @@ class AIFPlus(nn.Module):
         pred_clean_norm = pred_clean_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
         pred_deep_norm = pred_deep_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
         pred_linear_norm = pred_linear_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
+        pred_local_norm = pred_local_norm_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
         residual_norm = residual_term_bc.view(batch_size, self.n_vars, self.pred_len).transpose(1, 2)
 
         pred_clean = self.revin.denormalize(pred_clean_norm, masked_stats)
         pred_deep = pred_deep_norm * std_masked + mean_masked
         pred_linear = pred_linear_norm * std_masked + mean_masked
+        pred_local = pred_local_norm * std_masked
         residual = residual_norm * std_masked
 
         return {
@@ -963,9 +1167,11 @@ class AIFPlus(nn.Module):
             "pred_clean": pred_clean,
             "pred_deep": pred_deep,
             "pred_linear": pred_linear,
+            "pred_local": pred_local,
             "pred_residual": residual,
             "lambda_res": residual_gate.view(batch_size, self.n_vars),
             "lambda_deep": deep_gate.view(batch_size, self.n_vars),
+            "lambda_local": local_gate.view(batch_size, self.n_vars),
             "branch_weights": clean_out.get("branch_weights", pred_clean_norm_bc.new_zeros((batch_size * self.n_vars, 2))).view(batch_size, self.n_vars, 2),
             "task_embed": task_embed.view(batch_size, self.n_vars, -1),
         }
